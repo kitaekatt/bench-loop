@@ -39,6 +39,7 @@ async def run_benchmark(
     on_progress=None,
     runs: int | None = None,  # accepted but currently unused (single-run)
     timeout_sec: float | None = None,  # accepted but unused
+    remote: bool = False,  # mark as remote/cloud benchmark
 ) -> BenchmarkRun:
     # API back-compat: allow `run_benchmark(config)` where config has
     # the same attributes (model/endpoint/provider/suite_names/harness/...).
@@ -57,6 +58,12 @@ async def run_benchmark(
         raise ValueError("run_benchmark requires both `model` and `endpoint`")
     if provider not in PROVIDER_REGISTRY:
         raise ValueError(f"Unsupported provider: {provider}")
+
+    # Auto-detect remote if not explicitly set
+    if not remote:
+        endpoint_host = _endpoint_host(endpoint)
+        if endpoint_host and endpoint_host not in {"localhost", "127.0.0.1", "::1", ""}:
+            remote = True
 
     provider_module = PROVIDER_REGISTRY[provider]
     selected_suites = suites or DEFAULT_SUITES
@@ -82,7 +89,7 @@ async def run_benchmark(
         machine.backend = provider
 
     available_models = await provider_module.list_models(endpoint)
-    if model not in available_models:
+    if available_models and model not in available_models:
         raise ValueError(f"Model '{model}' not found on {endpoint}. Available: {', '.join(available_models)}")
 
     run_started = time.perf_counter()
@@ -103,6 +110,7 @@ async def run_benchmark(
         provider=provider,
         harness=harness,
         harness_version=getattr(harness_adapter, 'version', ''),
+        is_remote=remote,
     )
 
     speed_metric_samples: list[SpeedMetrics] = []
@@ -151,6 +159,7 @@ async def run_benchmark(
                     task,
                     harness=harness_adapter,
                     provider_name=provider,
+                    remote=remote,
                 )
             else:
                 result = await suite.run_task(
@@ -242,6 +251,7 @@ async def _run_speed_task(
     task: Any,
     harness: Any | None = None,
     provider_name: str = "ollama",
+    remote: bool = False,
 ) -> TaskResult:
     trial_results: list[TaskResult] = []
     request = (
@@ -249,12 +259,23 @@ async def _run_speed_task(
         if harness is not None
         else {"messages": task.messages, **task.config}
     )
+
+    # Use streaming for remote/cloud to get real TTFT + tok/s
+    use_streaming = remote and hasattr(provider_module, "chat_streaming")
+
     for _ in range(SPEED_TRIALS):
-        response = await provider_module.chat(
-            endpoint=endpoint,
-            model=model,
-            **request,
-        )
+        if use_streaming:
+            response = await provider_module.chat_streaming(
+                endpoint=endpoint,
+                model=model,
+                **request,
+            )
+        else:
+            response = await provider_module.chat(
+                endpoint=endpoint,
+                model=model,
+                **request,
+            )
         if harness is not None:
             response = harness.postprocess(response, task)
         trial_results.append(suite.evaluate(task, response))

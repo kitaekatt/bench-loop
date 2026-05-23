@@ -93,6 +93,8 @@ def render_run_summary(run: BenchmarkRun) -> None:
     _info_row("HARNESS", f"{run.harness} ({run.provider})")
     if run.machine.summary():
         _info_row("MACHINE", run.machine.summary())
+    if run.is_remote:
+        _info_row("MODE", "☁  remote/cloud (speed reweighted)")
     if run.speed_metrics.generation_tok_per_sec:
         _info_row("GEN TOK/S", f"{run.speed_metrics.generation_tok_per_sec:.2f}")
     console.print()
@@ -112,14 +114,30 @@ def render_run_summary(run: BenchmarkRun) -> None:
 
     _summary_rule("Summary")
     console.print()
-    rows = [
-        ("QUALITY", run.quality_score),
-        ("SPEED", run.speed_score),
-        ("RELIABILITY", run.reliability_score),
-        ("VALUE", run.value_score),
-    ]
-    for label, val in rows:
-        console.print(f"  [{ACCENT}]{label:<14}[/{ACCENT}][{DIM}]│[/{DIM}]  {val:.1f}")
+    if run.is_remote:
+        speed_label = f"{run.speed_score:.1f}" if run.speed_score > 0 else "N/A (no stream)"
+        rows: list[tuple[str, Any]] = [
+            ("QUALITY", run.quality_score),
+            ("SPEED", speed_label),
+            ("RELIABILITY", run.reliability_score),
+            ("VALUE", run.value_score),
+        ]
+        for label, val in rows:
+            if isinstance(val, str):
+                console.print(f"  [{ACCENT}]{label:<14}[/{ACCENT}][{DIM}]│[/{DIM}]  [{DIM}]{val}[/{DIM}]")
+            else:
+                console.print(f"  [{ACCENT}]{label:<14}[/{ACCENT}][{DIM}]│[/{DIM}]  {val:.1f}")
+        if run.speed_metrics.ttft_ms > 0:
+            console.print(f"  [{DIM}]TTFT: {run.speed_metrics.ttft_ms:.0f}ms | tok/s: {run.speed_metrics.generation_tok_per_sec:.1f}[/{DIM}]")
+    else:
+        rows = [
+            ("QUALITY", run.quality_score),
+            ("SPEED", run.speed_score),
+            ("RELIABILITY", run.reliability_score),
+            ("VALUE", run.value_score),
+        ]
+        for label, val in rows:
+            console.print(f"  [{ACCENT}]{label:<14}[/{ACCENT}][{DIM}]│[/{DIM}]  {val:.1f}")
     console.print(f"  [{DIM}]{'─' * 24}[/{DIM}]")
     overall = run.overall_score
     badge = _score_badge(overall)
