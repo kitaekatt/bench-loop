@@ -150,6 +150,19 @@ def run(
         except Exception:
             pass
 
+    # Auto-detect cloud endpoints if --remote not explicitly set
+    if not remote:
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(endpoint)
+            hostname = parsed.hostname or ""
+            # If not localhost/127.0.0.1/::1, assume cloud
+            if hostname and hostname not in ("localhost", "127.0.0.1", "::1", ""):
+                remote = True
+                click.echo(f"[auto-detected cloud endpoint: {hostname}]", err=True)
+        except Exception:
+            pass
+
     # Surface CLI hardware overrides to detect_hardware() via env vars so the
     # whole detection pipeline picks them up without threading another arg.
     if hardware:
@@ -167,6 +180,61 @@ def run(
     command_used = (command_used or os.environ.get("BENCHLOOP_COMMAND_USED") or "").strip() or None
 
     selected_suites = [item.strip() for item in suites.split(",") if item.strip()]
+    
+    # Progress callback for CLI output
+    import time
+    start_time = time.time()
+    total_tasks = 0
+    completed_tasks = 0
+    
+    def on_progress(event: dict) -> None:
+        nonlocal total_tasks, completed_tasks
+        event_type = event.get("type")
+        
+        if event_type == "run_started":
+            total_tasks = event.get("total_tasks", 0)
+            suite_names = event.get("suites", [])
+            click.echo(f"\n🚀 Starting benchmark: {len(suite_names)} suites, {total_tasks} tasks total", err=True)
+        
+        elif event_type == "suite_started":
+            suite = event.get("suite", "")
+            task_count = event.get("task_count", 0)
+            click.echo(f"\n📊 [{suite}] Running {task_count} tasks...", err=True)
+        
+        elif event_type == "task_completed":
+            completed_tasks = event.get("completed_tasks", 0)
+            suite = event.get("suite", "")
+            task_id = event.get("task_id", "")
+            passed = event.get("passed", False)
+            score = event.get("score", 0)
+            latency = event.get("latency_ms", 0)
+            
+            # Progress bar
+            progress = completed_tasks / total_tasks if total_tasks > 0 else 0
+            bar_width = 30
+            filled = int(bar_width * progress)
+            bar = "█" * filled + "░" * (bar_width - filled)
+            
+            # ETA calculation
+            elapsed = time.time() - start_time
+            eta = (elapsed / completed_tasks * (total_tasks - completed_tasks)) if completed_tasks > 0 else 0
+            eta_str = f"{int(eta // 60)}m {int(eta % 60)}s" if eta > 0 else "--"
+            
+            status = "✓" if passed else "✗"
+            click.echo(f"  [{bar}] {completed_tasks}/{total_tasks} {status} {task_id[:30]:<30} score={score:.0f} {latency/1000:.1f}s ETA={eta_str}", err=True)
+        
+        elif event_type == "suite_completed":
+            suite = event.get("suite", "")
+            score = event.get("score", 0)
+            pass_count = event.get("pass_count", 0)
+            task_count = event.get("task_count", 0)
+            click.echo(f"  ✅ {suite}: {score:.1f}/100 ({pass_count}/{task_count} passed)", err=True)
+        
+        elif event_type == "run_completed":
+            overall = event.get("overall_score", 0)
+            runtime = event.get("total_runtime_sec", 0)
+            click.echo(f"\n🎉 Benchmark complete! Overall: {overall:.1f}/100 in {runtime:.1f}s", err=True)
+    
     try:
         benchmark = asyncio.run(
             run_benchmark(
@@ -176,6 +244,7 @@ def run(
                 suites=selected_suites,
                 harness=harness,
                 remote=remote,
+                on_progress=on_progress,
             )
         )
     except ValueError as exc:

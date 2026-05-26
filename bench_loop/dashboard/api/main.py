@@ -42,7 +42,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from routes import benchmark, chat, hardware, health, models
+from routes import auth, auth_x, benchmark, chat, hardware, health, models, users, share_card, rankings
 
 app = FastAPI(title="BenchLoop", version="0.1.0")
 
@@ -59,6 +59,11 @@ app.include_router(models.router, prefix="/api")
 app.include_router(benchmark.router, prefix="/api")
 app.include_router(hardware.router, prefix="/api")
 app.include_router(chat.router, prefix="/api")
+app.include_router(auth.router, prefix="/api")
+app.include_router(auth_x.router, prefix="/api")
+app.include_router(users.router, prefix="/api")
+app.include_router(share_card.router, prefix="/api")
+app.include_router(rankings.router, prefix="/api")
 
 # Serve the bundled UI (built React SPA) at /
 _ui_dir = Path(__file__).resolve().parent.parent / "ui"

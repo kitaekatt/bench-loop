@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path as FsPath
 from typing import Any
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -52,10 +52,20 @@ class BenchmarkRequest(BaseModel):
     profile_avatar_url: str | None = None
     profile_url: str | None = None
     command_used: str | None = None
+    api_key: str | None = None
+    user_id: str | None = None
 
 
 @router.post("/benchmark/run")
 async def start_benchmark_route(req: BenchmarkRequest):
+    # Verify API key if provided
+    if req.api_key:
+        from .users import verify_api_key
+        verified_user_id = verify_api_key(req.api_key)
+        if not verified_user_id:
+            raise HTTPException(status_code=401, detail="Invalid API key")
+        req.user_id = verified_user_id
+    
     run_id = str(uuid.uuid4())[:8]
     # Use a plain namespace to stay compatible with multiple RunConfig schemas
     # (the canonical bench_loop uses `base_url`/`suites`/`trials`; the legacy one
@@ -152,6 +162,7 @@ async def _execute_run(run_id: str, req: "BenchmarkRequest", config: Any, on_pro
                 endpoint=req.endpoint,
                 publish_profile=publish_profile,
                 command_used=req.command_used,
+                user_id=req.user_id,
             )
             _active_runs[run_id]["saved_path"] = str(saved_path)
         except Exception as save_exc:
@@ -195,6 +206,7 @@ async def _execute_run(run_id: str, req: "BenchmarkRequest", config: Any, on_pro
                 events=_active_runs[run_id].get("events", []),
                 publish_profile=publish_profile,
                 command_used=req.command_used,
+                user_id=req.user_id,
             )
             _active_runs[run_id]["saved_path"] = str(saved_path)
         except Exception as save_exc:
@@ -234,7 +246,10 @@ async def stream_benchmark(run_id: str):
 
 
 @router.get("/benchmark/runs")
-async def list_runs(limit: int = Query(default=50, le=200)):
+async def list_runs(
+    limit: int = Query(default=50, le=200),
+    is_remote: bool | None = Query(default=None, description="Filter by remote/cloud (true) or local (false). Omit for all."),
+):
     """List past benchmark runs from disk."""
     if not RUNS_DIR.exists():
         return {"runs": []}
@@ -257,6 +272,11 @@ async def list_runs(limit: int = Query(default=50, le=200)):
             continue
         try:
             data = json.loads(run_file.read_text())
+            
+            # Filter by is_remote if specified
+            run_is_remote = data.get("is_remote", False)
+            if is_remote is not None and run_is_remote != is_remote:
+                continue
             model_obj = data.get("model", {}) or {}
             machine = data.get("machine", {}) or {}
             speed_metrics = data.get("speed_metrics", {}) or {}
@@ -284,6 +304,7 @@ async def list_runs(limit: int = Query(default=50, le=200)):
                 "quantization": model_obj.get("quantization", "") or "",
                 "family": model_obj.get("family", "") or "",
                 "parameter_count": model_obj.get("parameter_count", "") or "",
+                "is_remote": run_is_remote,
                 "overall_score": overall_v2,
                 "quality_score": quality_v2,
                 "speed_score": speed_score_v2,

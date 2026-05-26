@@ -82,6 +82,7 @@ def save_run(
     console: Console | None = None,
     publish_profile: dict | None = None,
     command_used: str | None = None,
+    user_id: str | None = None,
 ) -> Path:
     console = console or Console()
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -96,6 +97,8 @@ def save_run(
         run_dict["profile"] = profile
     if command_used and str(command_used).strip():
         run_dict["command_used"] = str(command_used).strip()
+    if user_id:
+        run_dict["user_id"] = user_id
     output_path.write_text(json.dumps(run_dict, indent=2), encoding="utf-8")
     console.print(f"Saved results to [bold]{output_path}[/bold]")
 
@@ -120,6 +123,7 @@ def save_failed_run(
     publish_profile: dict | None = None,
     command_used: str | None = None,
     console: Console | None = None,
+    user_id: str | None = None,
 ) -> Path:
     console = console or Console()
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -159,6 +163,8 @@ def save_failed_run(
         run_dict["profile"] = profile
     if command_used and str(command_used).strip():
         run_dict["command_used"] = str(command_used).strip()
+    if user_id:
+        run_dict["user_id"] = user_id
 
     output_path = run_dir / "run.json"
     output_path.write_text(json.dumps(run_dict, indent=2), encoding="utf-8")
