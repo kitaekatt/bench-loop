@@ -11,7 +11,7 @@ from pathlib import Path
 
 import click
 
-from bench_loop import __version__
+from bench_loop import __version__, cloud
 from bench_loop.benchmark_manifest import DEFAULT_PROFILE, PROFILES, classify_suites
 from bench_loop.harness import list_harnesses
 from bench_loop.report.console import print_run_report
@@ -65,6 +65,66 @@ def info() -> None:
     click.echo("\nAvailable harnesses:")
     for harness_name in list_harnesses():
         click.echo(f"  {harness_name}")
+
+
+@main.group("auth", help="Pair this Runner with your BenchLoop account.")
+def auth_group() -> None:
+    """Manage the Runner's scoped BenchLoop device credential."""
+
+
+@auth_group.command("login")
+@click.option("--api-url", default=None, help="BenchLoop API base URL.")
+@click.option(
+    "--device-name", default=None, help="Name shown for this Runner in your lab."
+)
+@click.option(
+    "--no-browser", is_flag=True, help="Print the verification URL without opening it."
+)
+def auth_login(api_url: str | None, device_name: str | None, no_browser: bool) -> None:
+    """Pair this machine through a short-lived browser code."""
+    try:
+        pairing = cloud.start_pairing(base_url=api_url, device_name=device_name)
+        click.echo("\nPair this BenchLoop Runner:")
+        click.secho(f"  {pairing.user_code}", fg="green", bold=True)
+        click.echo(f"  {pairing.verification_uri}")
+        if not no_browser:
+            cloud.open_verification_page(pairing)
+        click.echo("\nWaiting for approval", nl=False)
+        account = cloud.await_pairing(
+            pairing,
+            base_url=api_url,
+            on_wait=lambda: click.echo(".", nl=False),
+        )
+    except cloud.CloudError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.secho(f"\n✓ Paired as @{account.handle}", fg="green")
+    click.echo("The scoped Runner token is stored in your operating-system keychain.")
+
+
+@auth_group.command("status")
+def auth_status() -> None:
+    """Show the locally paired BenchLoop account."""
+    try:
+        account = cloud.load_account()
+        token = cloud.load_token(account.api_url if account else None)
+    except cloud.CloudError as exc:
+        raise click.ClickException(str(exc)) from exc
+    if not account or not token:
+        click.echo("Not paired. Run `benchloop auth login`.")
+        return
+    click.echo(f"Paired account: @{account.handle}")
+    click.echo(f"Runner device: {account.device_id}")
+    click.echo(f"API: {account.api_url}")
+
+
+@auth_group.command("logout")
+def auth_logout() -> None:
+    """Remove this Runner's local credential."""
+    try:
+        cloud.clear_account()
+    except cloud.CloudError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo("Runner credential removed from this machine.")
 
 
 @main.command()
@@ -171,6 +231,12 @@ def info() -> None:
         "when benchmarking a reasoning model to rule that out before trusting a low score."
     ),
 )
+@click.option(
+    "--publish/--no-publish",
+    "publish_result",
+    default=False,
+    help="Publish this completed run through your paired BenchLoop account.",
+)
 def run(
     model: str,
     endpoint: str,
@@ -190,6 +256,7 @@ def run(
     force_local: bool,
     api_key: str | None,
     max_tokens: int | None,
+    publish_result: bool,
 ) -> None:
     """Run a benchmark."""
     # Set API key from CLI flag if provided (takes precedence over env var)
@@ -394,12 +461,23 @@ def run(
         raise SystemExit(1)
     # Save before printing -- a console-rendering crash (e.g. legacy Windows
     # cp1252 terminals choking on an emoji) must not cost the whole run's data.
-    save_run(
+    output_path = save_run(
         benchmark,
         endpoint=endpoint,
         publish_profile=publish_profile,
         command_used=command_used,
     )
+    if publish_result:
+        try:
+            published = cloud.publish_run(output_path)
+            url = published.get("url") or "https://bench-loop.com/runs"
+            click.secho(f"✓ Published: {url}", fg="green")
+        except cloud.CloudError as exc:
+            click.secho(
+                f"Publish failed: {exc}\nThe benchmark remains saved locally at {output_path}",
+                fg="yellow",
+                err=True,
+            )
     try:
         print_run_report(benchmark)
     except Exception as exc:  # noqa: BLE001
@@ -412,6 +490,43 @@ def suites() -> None:
     summaries = asyncio.run(_suite_summaries())
     for summary in summaries:
         click.echo(f"{summary.name}: {summary.task_count} tasks")
+
+
+@main.command("publish")
+@click.argument("run_ref", required=False)
+@click.option("--api-url", default=None, help="BenchLoop API base URL.")
+@click.option(
+    "--visibility",
+    type=click.Choice(["public", "private"]),
+    default="public",
+    show_default=True,
+)
+@click.option(
+    "--post/--no-post",
+    "create_post",
+    default=True,
+    help="Add the run to your builder feed.",
+)
+def publish_command(
+    run_ref: str | None,
+    api_url: str | None,
+    visibility: str,
+    create_post: bool,
+) -> None:
+    """Publish a captured v3 run by path, run ID, or latest when omitted."""
+    try:
+        path = cloud.resolve_run_path(run_ref, RUNS_DIR)
+        result = cloud.publish_run(
+            path,
+            base_url=api_url,
+            visibility=visibility,
+            create_post=create_post,
+        )
+    except cloud.CloudError as exc:
+        raise click.ClickException(str(exc)) from exc
+    url = result.get("url") or "https://bench-loop.com/runs"
+    click.secho(f"✓ Published {path.parent.name}", fg="green")
+    click.echo(url)
 
 
 @main.command()

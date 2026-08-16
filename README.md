@@ -14,7 +14,7 @@
 
 BenchLoop is a local-first CLI + web app for benchmarking LLMs running on your own hardware or cloud providers. It scores models across eight repeatable suites — quality, speed, long-context recall, agentic tool use, coding, instruction following — and gives you receipts: per-task outputs, latency, token counts, machine info, scores.
 
-Local runs need no account or API key; cloud providers use standard OpenAI-compatible auth. Publishing is optional (`BENCHLOOP_NO_SUBMIT=1`). Your model, your machine (or your provider), your numbers.
+Local runs need no account or BenchLoop API key; cloud model providers use standard OpenAI-compatible auth. Results stay on your machine unless you explicitly publish them through a paired BenchLoop account. Your model, your machine (or your provider), your numbers.
 
 ```
 $ benchloop run --model qwen3:8b --suites speed,toolcall,agent
@@ -26,7 +26,7 @@ Speed    78.9  █████████░
 Agent    96.9  █████████▌
 ```
 
-Published runs live at <https://bench-loop.com/leaderboard>. Every completed local benchmark auto-publishes there.
+Published runs live at <https://bench-loop.com/leaderboard>. Local benchmark data is private by default.
 ## Why
 
 Hosted LLM leaderboards answer *"which model wins on a server farm someone else paid for?"* BenchLoop answers *"which model + harness + hardware combination actually works for me right now?"* — the question you have when picking a local stack.
@@ -243,19 +243,31 @@ Tabs: Models, Benchmark, Leaderboard, Compare runs, Chat, agent trace viewer.
 
 ## Publish a run
 
-By default, every completed benchmark publishes to <https://bench-loop.com/leaderboard> via `https://api.bench-loop.com/submit`. Runs are deduped by `(machine_id, run_id)` so the same run from the same machine won't be double-counted.
-
-Opt out:
+Pair each Runner once through GitHub in your browser. The scoped device token is stored in the operating-system keychain—not in the run JSON or shell history:
 
 ```bash
-export BENCHLOOP_NO_SUBMIT=1
+benchloop auth login
+benchloop auth status
 ```
 
-You can still manually export a snapshot for sharing / archiving:
+Runs remain local until you choose to publish one:
+
+```bash
+benchloop publish                         # latest captured v3 run
+benchloop publish <run-id>                # a named run under ~/.bench-loop/runs
+benchloop publish ./path/to/run.json      # an explicit file
+benchloop run --model qwen3:8b --publish  # publish after a successful run
+```
+
+Use `--visibility public` or `private`, and `--no-post` if the run should not create a feed post. Only v3 runs with complete provenance and a SHA-256 manifest can use authenticated publishing.
+
+You can also export a local snapshot for sharing or archiving without pairing:
 
 ```bash
 benchloop export --output my-runs.json
 ```
+
+Operators temporarily depending on the pre-account submission endpoint can opt into it with `BENCHLOOP_LEGACY_AUTO_SUBMIT=1`. It is disabled by default and will be removed after the authenticated ingestion path is fully deployed.
 
 ## Architecture
 
