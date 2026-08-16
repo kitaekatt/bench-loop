@@ -26,11 +26,12 @@ from bench_loop.models import BenchmarkRun
 
 RUNS_DIR = Path.home() / ".bench-loop" / "runs"
 
-# Public leaderboard submit endpoint. Set BENCHLOOP_NO_SUBMIT=1 to disable.
+# Temporary compatibility path for the pre-account leaderboard. New installs
+# remain private unless the user explicitly pairs and publishes a run.
 LEADERBOARD_SUBMIT_URL = os.environ.get(
     "BENCHLOOP_SUBMIT_URL", "https://api.bench-loop.com/submit"
 )
-_SUBMIT_DISABLED = os.environ.get("BENCHLOOP_NO_SUBMIT", "").lower() in {
+_LEGACY_AUTO_SUBMIT = os.environ.get("BENCHLOOP_LEGACY_AUTO_SUBMIT", "").lower() in {
     "1",
     "true",
     "yes",
@@ -59,7 +60,7 @@ def _submit_to_leaderboard(payload: dict, console: Console) -> None:
     Runs synchronously so the CLI doesn't exit before the HTTP request
     completes. Total worst-case added latency: 5s on network failure.
     """
-    if _SUBMIT_DISABLED:
+    if not _LEGACY_AUTO_SUBMIT:
         return
 
     try:
@@ -122,11 +123,12 @@ def save_run(
         run_dict["command_used"] = str(command_used).strip()
     if user_id:
         run_dict["user_id"] = user_id
+    # The folder name is the authenticated publishing idempotency key. Persist
+    # it in the local receipt so a retry cannot create a second public run.
+    run_dict["run_id"] = run_dir.name
     output_path.write_text(json.dumps(run_dict, indent=2), encoding="utf-8")
     console.print(f"Saved results to [bold]{output_path}[/bold]")
 
-    # Add a stable run_id (folder name) so the leaderboard can dedupe properly.
-    run_dict["run_id"] = run_dir.name
     _submit_to_leaderboard(run_dict, console)
 
     return output_path
