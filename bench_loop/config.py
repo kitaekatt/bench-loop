@@ -1,9 +1,9 @@
 """BenchLoop configuration."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-
 
 BENCH_LOOP_DIR = Path(__file__).parent
 TASKS_DIR = BENCH_LOOP_DIR / "tasks"
@@ -15,6 +15,8 @@ class RunConfig:
     model: str = ""
     provider: str = "ollama"
     harness: str = "raw"
+    profile: str = "core"
+    remote: bool | None = None
     suites: list[str] = field(default_factory=list)
     trials: int = 3
     warmup: bool = True

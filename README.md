@@ -12,9 +12,9 @@
 
 **Benchmark local LLMs by what actually matters.**
 
-BenchLoop is a local-first CLI + web app for benchmarking LLMs running on your own hardware or cloud providers. It scores models across seven repeatable suites — quality, speed, reliability, agentic tool use, coding, instruction following — and gives you receipts: per-task outputs, latency, token counts, machine info, scores.
+BenchLoop is a local-first CLI + web app for benchmarking LLMs running on your own hardware or cloud providers. It scores models across eight repeatable suites — quality, speed, long-context recall, agentic tool use, coding, instruction following — and gives you receipts: per-task outputs, latency, token counts, machine info, scores.
 
-No accounts, no telemetry. Local models need no API keys; cloud providers use standard OpenAI-compatible auth. Your model, your machine (or your provider), your numbers.
+Local runs need no account or API key; cloud providers use standard OpenAI-compatible auth. Publishing is optional (`BENCHLOOP_NO_SUBMIT=1`). Your model, your machine (or your provider), your numbers.
 
 ```
 $ benchloop run --model qwen3:8b --suites speed,toolcall,agent
@@ -76,7 +76,20 @@ benchloop run \
   --provider ollama
 ```
 
-This runs every default suite, scores them, prints a console report, and persists the full run to `~/.bench-loop/runs/`.
+This runs the versioned `core` profile, scores it, prints a console report, and persists the full run to `~/.bench-loop/runs/`.
+
+### Benchmark profiles
+
+```bash
+benchloop run --model qwen3:8b --profile smoke  # 39-task sanity check
+benchloop run --model qwen3:8b --profile core   # 81-task default
+benchloop run --model qwen3:8b --profile full   # 93 tasks + agent + 2K–32K context
+benchloop run --model qwen3:8b --profile core --trials 5
+```
+
+Every run stores its profile, benchmark/scoring version, coverage, and a SHA-256
+manifest of the exact prompts, generation settings, and validators. A custom
+`--suites` run is not silently presented as a complete benchmark.
 
 ### Run a subset
 
@@ -128,10 +141,13 @@ benchloop run \
   --remote
 ```
 
-The `--remote` flag (auto-detected for non-localhost endpoints) switches to cloud-aware scoring:
+The `--remote` flag (auto-detected for public API endpoints) switches to cloud-aware speed scoring:
 - **Speed** uses streaming TTFT (time-to-first-token) + effective content tok/s
-- **Overall** = 0.50·quality + 0.25·speed + 0.25·reliability (vs local's 0.55/0.20/0.25)
 - Reasoning models: content tok/s excludes internal thinking tokens
+
+Private/LAN and Tailscale addresses are treated as local hardware. For unusual
+DNS or tunnel setups, choose explicitly with `--local` or `--remote` so a remote
+4090 is not scored with a hosted-API curve.
 
 ### API key auth
 
@@ -188,41 +204,46 @@ benchloop dashboard --dev
 
 | Suite | What it scores |
 |---|---|
-| `speed` | Latency, throughput, TTFT, generation tok/s across short/medium/long contexts |
+| `speed` | Latency, throughput, TTFT, generation tok/s across short/medium/long output lengths |
 | `toolcall` | Structured tool-call correctness across realistic tasks (weather, stocks, email, search) |
-| `coding` | Executable Python tasks verified in a sandboxed subprocess (10s timeout) |
+| `coding` | Executable Python tasks verified in a restricted interpreter with policy, time, output, and resource limits |
 | `dataextract` | JSON / structured extraction from messy natural language |
 | `instructfollow` | Constraint following, formatting, exactness |
 | `reasonmath` | Small reasoning + math tasks with deterministic checks |
+| `longcontext` | Deterministic retrieval and prefill telemetry at approximate 2K, 8K, 16K, and 32K prompt tiers |
 | `agent` | **Multi-turn agentic tool use.** BenchLoop drives a real loop: model emits a tool call, BenchLoop executes it locally, feeds the result back, model iterates until done. Scores correctness, efficiency, no-hallucination, required-tool coverage. |
 
 ## Scoring
 
 ```
-Local:  Overall = 0.55 · quality + 0.20 · speed + 0.25 · reliability
-Cloud:  Overall = 0.50 · quality + 0.25 · speed + 0.25 · reliability  (with streaming speed data)
-        Overall = 0.65 · quality + 0.35 · reliability                   (no speed data)
+Overall = 0.70 · quality + 0.25 · speed + 0.05 · reliability
+No speed suite: 0.90 · quality + 0.10 · reliability
 ```
 
-- **Quality** = mean of non-speed suite scores (size-fair).
+- **Quality** = fixed profile-specific weighted average of capability suites.
 - **Speed (local)** = `12.54 · log2(tok/s) + 0.9`, clamped to 0–100.
 - **Speed (cloud)** = 0.60 · TTFT_score + 0.40 · tok/s_score, where TTFT uses exponential decay (200ms→100, 2000ms→40) and tok/s uses a log curve calibrated for 20-150 tok/s.
-- **Reliability** = pass rate across all tasks.
+- **Reliability** = endpoint/runtime execution success, separate from model correctness.
 - **Agent** = `correct_final + efficient + no_hallucinated_tools + all_required_called`, 25 pts each, averaged across tasks.
+
+Speed prompts use three trials by default, discard the first warmup, select the
+median post-warmup trial, and persist run-level median plus p50/p95 telemetry.
+See [the v3 benchmark specification](docs/BENCHMARK_SPEC_V3.md) for profile
+weights, comparability rules, long-context protocol, and coding-execution limits.
 
 ## Local web app
 
 A FastAPI backend + React frontend bundle ships alongside the CLI for visualizing runs:
 
 ```bash
-benchloop dashboard   # starts the local web app on :5180
+benchloop dashboard   # starts the local web app on :8877
 ```
 
 Tabs: Models, Benchmark, Leaderboard, Compare runs, Chat, agent trace viewer.
 
 ## Publish a run
 
-Every completed benchmark auto-publishes to <https://bench-loop.com/leaderboard> via `https://api.bench-loop.com/submit`. Runs are deduped by `(machine_id, run_id)` so the same run from the same machine won't be double-counted.
+By default, every completed benchmark publishes to <https://bench-loop.com/leaderboard> via `https://api.bench-loop.com/submit`. Runs are deduped by `(machine_id, run_id)` so the same run from the same machine won't be double-counted.
 
 Opt out:
 
@@ -255,12 +276,12 @@ bench-loop-web/                ← the web app (separate repo)
 
 ## Status
 
-BenchLoop is **v0.2 beta**. The benchmark surface, scoring, web app, agent loop, four harnesses, and cloud provider support all work end-to-end. Stuff still on the roadmap:
+BenchLoop is **v0.3 beta**. Versioned profiles, provenance manifests, restricted coding execution, long-context retrieval, agent telemetry, four harnesses, and local/cloud provider modes work end-to-end. Next on the roadmap:
 
 - ~~Streaming TTFT for OpenAI-compatible providers~~ ✅ (v0.2.3+ with `--remote`)
-- Bigger task fixtures (each suite is intentionally small and frozen for v1)
-- Hosted submission flow for community runs
-- Cloud-specific leaderboard on bench-loop.com (filter by local vs remote)
+- Vision and multimodal evaluation
+- Peak GPU memory, energy-per-token, and sustained-load telemetry
+- Seeded private challenge sets for stronger contamination resistance
 - More provider adapters (TGI, Bedrock, etc. if there's demand)
 
 ## License

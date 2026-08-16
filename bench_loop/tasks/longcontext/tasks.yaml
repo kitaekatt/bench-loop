@@ -1,0 +1,64 @@
+tasks:
+  - id: longcontext-2k-early
+    suite: longcontext
+    title: "2K retrieval: early needle"
+    difficulty: easy
+    capability_tags: [long-context, retrieval, 2k]
+    messages:
+      - role: user
+        content: |
+          Read the archive below. Ignore routine checksums. What is Project Aurora's access code?
+          Return only the access code.
+
+          {{CONTEXT}}
+    config: {max_tokens: 32, temperature: 0.0}
+    validation: {expected: "AURORA-2K-7319"}
+    metadata: {target_context_tokens: 2048, needle_position: 0.1}
+
+  - id: longcontext-8k-middle
+    suite: longcontext
+    title: "8K retrieval: middle needle"
+    difficulty: medium
+    capability_tags: [long-context, retrieval, 8k]
+    messages:
+      - role: user
+        content: |
+          Read the archive below. Ignore routine checksums. What is Project Aurora's access code?
+          Return only the access code.
+
+          {{CONTEXT}}
+    config: {max_tokens: 32, temperature: 0.0}
+    validation: {expected: "AURORA-8K-2841"}
+    metadata: {target_context_tokens: 8192, needle_position: 0.5}
+
+  - id: longcontext-16k-late
+    suite: longcontext
+    title: "16K retrieval: late needle"
+    difficulty: hard
+    capability_tags: [long-context, retrieval, 16k]
+    messages:
+      - role: user
+        content: |
+          Read the archive below. Ignore routine checksums. What is Project Aurora's access code?
+          Return only the access code.
+
+          {{CONTEXT}}
+    config: {max_tokens: 32, temperature: 0.0}
+    validation: {expected: "AURORA-16K-9157"}
+    metadata: {target_context_tokens: 16384, needle_position: 0.9}
+
+  - id: longcontext-32k-middle
+    suite: longcontext
+    title: "32K retrieval: middle needle"
+    difficulty: hard
+    capability_tags: [long-context, retrieval, 32k]
+    messages:
+      - role: user
+        content: |
+          Read the archive below. Ignore routine checksums. What is Project Aurora's access code?
+          Return only the access code.
+
+          {{CONTEXT}}
+    config: {max_tokens: 32, temperature: 0.0}
+    validation: {expected: "AURORA-32K-4603"}
+    metadata: {target_context_tokens: 32768, needle_position: 0.5}

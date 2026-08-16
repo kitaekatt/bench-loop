@@ -1,10 +1,10 @@
 """Benchmark run management — kick off, stream, list, detail."""
+
 from __future__ import annotations
 
 import asyncio
 import json
 import shutil
-import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path as FsPath
@@ -12,12 +12,11 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
-from bench_loop.config import RunConfig
+from bench_loop.benchmark_manifest import DEFAULT_PROFILE, classify_suites
 from bench_loop.runner.orchestrator import run_benchmark
 from bench_loop.runner.result_writer import save_failed_run, save_run
-from bench_loop.models import BenchmarkRun
 
 router = APIRouter()
 
@@ -45,10 +44,12 @@ class BenchmarkRequest(BaseModel):
     model: str
     endpoint: str = "http://localhost:11434"
     provider: str = "ollama"
-    suites: list[str] = Field(default_factory=lambda: ["speed", "toolcall", "coding", "dataextract", "instructfollow", "reasonmath"])
+    profile: str = DEFAULT_PROFILE
+    suites: list[str] | None = None
     harness: str = "raw"
     runs: int = 3
     timeout_sec: float = 300.0
+    remote: bool | None = None
     profile_name: str | None = None
     profile_avatar_url: str | None = None
     profile_url: str | None = None
@@ -62,16 +63,18 @@ async def start_benchmark_route(req: BenchmarkRequest):
     # Verify API key if provided
     if req.api_key:
         from .users import verify_api_key
+
         verified_user_id = verify_api_key(req.api_key)
         if not verified_user_id:
             raise HTTPException(status_code=401, detail="Invalid API key")
         req.user_id = verified_user_id
-    
+
     run_id = str(uuid.uuid4())[:8]
     # Use a plain namespace to stay compatible with multiple RunConfig schemas
     # (the canonical bench_loop uses `base_url`/`suites`/`trials`; the legacy one
     # used `endpoint`/`suite_names`/`runs`). The orchestrator handles both.
     from types import SimpleNamespace
+
     config = SimpleNamespace(
         model=req.model,
         provider=req.provider,
@@ -83,6 +86,8 @@ async def start_benchmark_route(req: BenchmarkRequest):
         runs=req.runs,
         trials=req.runs,
         timeout_sec=req.timeout_sec,
+        profile=req.profile,
+        remote=req.remote,
     )
 
     queue = _endpoint_queues.setdefault(req.endpoint, [])
@@ -97,6 +102,8 @@ async def start_benchmark_route(req: BenchmarkRequest):
             "model": req.model,
             "endpoint": req.endpoint,
             "suites": req.suites,
+            "profile": req.profile,
+            "remote": req.remote,
             "harness": req.harness,
         },
         "events": [],
@@ -121,7 +128,11 @@ async def start_benchmark_route(req: BenchmarkRequest):
 
     task = asyncio.ensure_future(_run())
     _active_runs[run_id]["task"] = task
-    return {"run_id": run_id, "status": _active_runs[run_id]["status"], "queue_position": position}
+    return {
+        "run_id": run_id,
+        "status": _active_runs[run_id]["status"],
+        "queue_position": position,
+    }
 
 
 @router.post("/benchmark/cancel/{run_id}")
@@ -146,7 +157,9 @@ async def cancel_benchmark(run_id: str):
     return {"ok": True, "status": "cancelled"}
 
 
-async def _execute_run(run_id: str, req: "BenchmarkRequest", config: Any, on_progress: Any) -> None:
+async def _execute_run(
+    run_id: str, req: BenchmarkRequest, config: Any, on_progress: Any
+) -> None:
     try:
         result = await run_benchmark(config, on_progress=on_progress)
         _active_runs[run_id]["status"] = "completed"
@@ -167,10 +180,12 @@ async def _execute_run(run_id: str, req: "BenchmarkRequest", config: Any, on_pro
             )
             _active_runs[run_id]["saved_path"] = str(saved_path)
         except Exception as save_exc:
-            _active_runs[run_id]["events"].append({
-                "type": "persist_failed",
-                "error": str(save_exc),
-            })
+            _active_runs[run_id]["events"].append(
+                {
+                    "type": "persist_failed",
+                    "error": str(save_exc),
+                }
+            )
     except asyncio.CancelledError:
         # User cancelled — already marked in cancel_benchmark, but make sure.
         if _active_runs[run_id]["status"] not in ("completed", "failed"):
@@ -178,17 +193,20 @@ async def _execute_run(run_id: str, req: "BenchmarkRequest", config: Any, on_pro
         raise
     except Exception as exc:
         import traceback
+
         tb = traceback.format_exc()
-        err_msg = str(exc) or f"{type(exc).__name__}: {repr(exc)}"
+        err_msg = str(exc) or f"{type(exc).__name__}: {exc!r}"
         _active_runs[run_id]["status"] = "failed"
         _active_runs[run_id]["completed_at"] = datetime.now(timezone.utc).isoformat()
         _active_runs[run_id]["error"] = err_msg
         _active_runs[run_id]["traceback"] = tb
-        _active_runs[run_id]["events"].append({
-            "type": "run_failed",
-            "error": err_msg,
-            "exception_class": type(exc).__name__,
-        })
+        _active_runs[run_id]["events"].append(
+            {
+                "type": "run_failed",
+                "error": err_msg,
+                "exception_class": type(exc).__name__,
+            }
+        )
         try:
             publish_profile = {
                 "name": req.profile_name,
@@ -208,19 +226,23 @@ async def _execute_run(run_id: str, req: "BenchmarkRequest", config: Any, on_pro
                 publish_profile=publish_profile,
                 command_used=req.command_used,
                 user_id=req.user_id,
+                benchmark_profile=req.profile,
             )
             _active_runs[run_id]["saved_path"] = str(saved_path)
         except Exception as save_exc:
-            _active_runs[run_id]["events"].append({
-                "type": "persist_failed",
-                "error": str(save_exc),
-            })
+            _active_runs[run_id]["events"].append(
+                {
+                    "type": "persist_failed",
+                    "error": str(save_exc),
+                }
+            )
         print(f"[bench-loop-api] run {run_id} failed:\n{tb}", flush=True)
 
 
 @router.get("/benchmark/stream/{run_id}")
 async def stream_benchmark(run_id: str):
     """SSE stream for benchmark progress — emits granular task-level events."""
+
     async def event_generator():
         if run_id not in _active_runs:
             yield f"data: {json.dumps({'type': 'error', 'error': 'Run not found'})}\n\n"
@@ -249,16 +271,17 @@ async def stream_benchmark(run_id: str):
 @router.get("/benchmark/runs")
 async def list_runs(
     limit: int = Query(default=50, le=200),
-    is_remote: bool | None = Query(default=None, description="Filter by remote/cloud (true) or local (false). Omit for all."),
+    is_remote: bool | None = Query(
+        default=None,
+        description="Filter by remote/cloud (true) or local (false). Omit for all.",
+    ),
 ):
     """List past benchmark runs from disk."""
     if not RUNS_DIR.exists():
         return {"runs": []}
 
-    # "Full benchmark" = at least these quality suites + speed. Coding is bonus.
-    REQUIRED_FULL_SUITES = {"speed", "toolcall", "dataextract", "instructfollow", "reasonmath"}
-
     import math
+
     def _recompute_speed_score(tok_per_sec: float) -> float:
         """Match bench_loop.suites.speed v2 curve so older runs use the new scale."""
         if tok_per_sec <= 0:
@@ -273,7 +296,7 @@ async def list_runs(
             continue
         try:
             data = json.loads(run_file.read_text())
-            
+
             # Filter by is_remote if specified
             run_is_remote = data.get("is_remote", False)
             if is_remote is not None and run_is_remote != is_remote:
@@ -283,65 +306,94 @@ async def list_runs(
             speed_metrics = data.get("speed_metrics", {}) or {}
             suite_map = data.get("suites", {}) or {}
             suite_names = list(suite_map.keys())
-            is_full = REQUIRED_FULL_SUITES.issubset(set(suite_names))
+            benchmark_profile = data.get("benchmark_profile") or classify_suites(
+                suite_names
+            )
+            is_full = benchmark_profile == "full"
+            is_core = benchmark_profile == "core"
 
-            # Recompute speed score from tok/s using the v2 curve so historical
-            # runs (which used the old 25*log2 capped-at-100 curve) display
-            # comparably to new runs.
+            # Preserve versioned v3 scores exactly. Legacy runs retain the v2
+            # display migration but are visibly marked and never mixed into a
+            # versioned comparison without that label.
             gen_tok_per_sec = speed_metrics.get("generation_tok_per_sec", 0) or 0
-            recomputed_speed = _recompute_speed_score(gen_tok_per_sec)
-            speed_score_v2 = recomputed_speed
-            # Recompute overall using new speed score (quality/reliability unchanged).
-            quality_v2 = data.get("quality_score", 0)
-            reliability_v2 = data.get("reliability_score", 0)
-            overall_v2 = 0.55 * quality_v2 + 0.20 * speed_score_v2 + 0.25 * reliability_v2
-            runs.append({
-                "id": d.name,
-                "status": data.get("status", "completed"),
-                "error": data.get("error", "") or "",
-                "traceback": data.get("traceback", "") or "",
-                "timestamp": data.get("timestamp", ""),
-                "model": model_obj.get("model_id", "unknown"),
-                "quantization": model_obj.get("quantization", "") or "",
-                "family": model_obj.get("family", "") or "",
-                "parameter_count": model_obj.get("parameter_count", "") or "",
-                "is_remote": run_is_remote,
-                "overall_score": overall_v2,
-                "quality_score": quality_v2,
-                "speed_score": speed_score_v2,
-                "reliability_score": reliability_v2,
-                "overall_score_raw": data.get("overall_score", 0),
-                "speed_score_raw": data.get("speed_score", 0),
-                "value_score": data.get("value_score", 0),
-                "total_runtime_sec": data.get("total_runtime_sec", 0),
-                "harness": data.get("harness", "raw"),
-                "suites": {
-                    name: {
-                        "score": s.get("score", 0),
-                        "pass_count": s.get("pass_count", 0),
-                        "task_count": s.get("task_count", 0),
-                    }
-                    for name, s in suite_map.items()
-                },
-                "suite_count": len(suite_names),
-                "suite_names": suite_names,
-                "is_full_benchmark": is_full,
-                "provider": data.get("provider", ""),
-                "backend": machine.get("backend", data.get("provider", "")),
-                "machine": machine.get("machine_id", ""),
-                "profile_name": ((data.get("profile") or {}).get("name") or ""),
-                "profile_avatar_url": ((data.get("profile") or {}).get("avatar_url") or ""),
-                "profile_url": ((data.get("profile") or {}).get("profile_url") or ""),
-                "command_used": data.get("command_used", "") or "",
-                "gpu": machine.get("gpu", ""),
-                "gpu_memory_gb": machine.get("gpu_memory_gb", 0),
-                "cpu": machine.get("cpu", ""),
-                "system_memory_gb": machine.get("system_memory_gb", 0),
-                "os": machine.get("os", ""),
-                "generation_tok_per_sec": speed_metrics.get("generation_tok_per_sec", 0),
-                "prompt_eval_tok_per_sec": speed_metrics.get("prompt_eval_tok_per_sec", 0),
-                "ttft_ms": speed_metrics.get("ttft_ms", 0),
-            })
+            is_versioned = bool(data.get("score_schema_version"))
+            quality_display = data.get("quality_score", 0)
+            reliability_display = data.get("reliability_score", 0)
+            if is_versioned:
+                speed_display = data.get("speed_score", 0)
+                overall_display = data.get("overall_score", 0)
+            else:
+                speed_display = _recompute_speed_score(gen_tok_per_sec)
+                overall_display = (
+                    0.55 * quality_display
+                    + 0.20 * speed_display
+                    + 0.25 * reliability_display
+                )
+            runs.append(
+                {
+                    "id": d.name,
+                    "status": data.get("status", "completed"),
+                    "error": data.get("error", "") or "",
+                    "traceback": data.get("traceback", "") or "",
+                    "timestamp": data.get("timestamp", ""),
+                    "model": model_obj.get("model_id", "unknown"),
+                    "quantization": model_obj.get("quantization", "") or "",
+                    "family": model_obj.get("family", "") or "",
+                    "parameter_count": model_obj.get("parameter_count", "") or "",
+                    "is_remote": run_is_remote,
+                    "overall_score": overall_display,
+                    "quality_score": quality_display,
+                    "speed_score": speed_display,
+                    "reliability_score": reliability_display,
+                    "overall_score_raw": data.get("overall_score", 0),
+                    "speed_score_raw": data.get("speed_score", 0),
+                    "value_score": data.get("value_score", 0),
+                    "total_runtime_sec": data.get("total_runtime_sec", 0),
+                    "harness": data.get("harness", "raw"),
+                    "suites": {
+                        name: {
+                            "score": s.get("score", 0),
+                            "pass_count": s.get("pass_count", 0),
+                            "task_count": s.get("task_count", 0),
+                        }
+                        for name, s in suite_map.items()
+                    },
+                    "suite_count": len(suite_names),
+                    "suite_names": suite_names,
+                    "is_full_benchmark": is_full,
+                    "is_core_benchmark": is_core,
+                    "benchmark_id": data.get("benchmark_id", "benchloop-legacy"),
+                    "benchmark_version": data.get("benchmark_version", "legacy"),
+                    "benchmark_profile": benchmark_profile,
+                    "score_schema_version": data.get("score_schema_version", "legacy"),
+                    "manifest_hash": data.get("manifest_hash", ""),
+                    "coverage_score": data.get("coverage_score", 0),
+                    "comparable": data.get("comparable", is_full or is_core),
+                    "provider": data.get("provider", ""),
+                    "backend": machine.get("backend", data.get("provider", "")),
+                    "machine": machine.get("machine_id", ""),
+                    "profile_name": ((data.get("profile") or {}).get("name") or ""),
+                    "profile_avatar_url": (
+                        (data.get("profile") or {}).get("avatar_url") or ""
+                    ),
+                    "profile_url": (
+                        (data.get("profile") or {}).get("profile_url") or ""
+                    ),
+                    "command_used": data.get("command_used", "") or "",
+                    "gpu": machine.get("gpu", ""),
+                    "gpu_memory_gb": machine.get("gpu_memory_gb", 0),
+                    "cpu": machine.get("cpu", ""),
+                    "system_memory_gb": machine.get("system_memory_gb", 0),
+                    "os": machine.get("os", ""),
+                    "generation_tok_per_sec": speed_metrics.get(
+                        "generation_tok_per_sec", 0
+                    ),
+                    "prompt_eval_tok_per_sec": speed_metrics.get(
+                        "prompt_eval_tok_per_sec", 0
+                    ),
+                    "ttft_ms": speed_metrics.get("ttft_ms", 0),
+                }
+            )
         except Exception:
             continue
 
@@ -396,7 +448,9 @@ async def delete_run(run_id: str):
     """Delete a persisted local benchmark run."""
     state = _active_runs.get(run_id)
     if state and state.get("status") not in ("completed", "failed", "cancelled"):
-        raise HTTPException(status_code=409, detail="Cannot delete an active run. Cancel it first.")
+        raise HTTPException(
+            status_code=409, detail="Cannot delete an active run. Cancel it first."
+        )
 
     runs_root = RUNS_DIR.resolve()
     run_dir = (RUNS_DIR / run_id).resolve()

@@ -44,7 +44,9 @@ def _render_header() -> None:
 
 
 def _info_row(label: str, value: str) -> None:
-    console.print(f"  [{BOLD_ACCENT}]◉[/{BOLD_ACCENT}] [{ACCENT}]{label:<10}[/{ACCENT}] {value}")
+    console.print(
+        f"  [{BOLD_ACCENT}]◉[/{BOLD_ACCENT}] [{ACCENT}]{label:<10}[/{ACCENT}] {value}"
+    )
 
 
 def _rule(title: str | None = None) -> None:
@@ -58,7 +60,9 @@ def _rule(title: str | None = None) -> None:
 def _summary_rule(title: str | None = None) -> None:
     if title:
         pad = HEADER_WIDTH - len(title) - 6
-        console.print(f"\n[{BOLD_ACCENT}]═══ {title} {'═' * max(pad, 4)}[/{BOLD_ACCENT}]")
+        console.print(
+            f"\n[{BOLD_ACCENT}]═══ {title} {'═' * max(pad, 4)}[/{BOLD_ACCENT}]"
+        )
     else:
         console.print(f"[{BOLD_ACCENT}]{'═' * HEADER_WIDTH}[/{BOLD_ACCENT}]")
 
@@ -91,12 +95,23 @@ def render_run_summary(run: BenchmarkRun) -> None:
     _render_header()
     _info_row("MODEL", run.model.model_id)
     _info_row("HARNESS", f"{run.harness} ({run.provider})")
+    profile_label = f"{run.benchmark_profile} · benchmark {run.benchmark_version}"
+    if not run.comparable:
+        profile_label += f" · {run.coverage_score:.0f}% coverage (non-comparable)"
+    _info_row("PROFILE", profile_label)
     if run.machine.summary():
         _info_row("MACHINE", run.machine.summary())
     if run.is_remote:
-        _info_row("MODE", "☁  remote/cloud (speed reweighted)")
+        _info_row("MODE", "☁  remote/cloud (cloud-aware speed curve)")
     if run.speed_metrics.generation_tok_per_sec:
         _info_row("GEN TOK/S", f"{run.speed_metrics.generation_tok_per_sec:.2f}")
+        if run.speed_metrics.sample_count:
+            _info_row(
+                "SPEED DIST",
+                f"p50 {run.speed_metrics.generation_tok_per_sec_p50:.2f} · "
+                f"p95 {run.speed_metrics.generation_tok_per_sec_p95:.2f} · "
+                f"n={run.speed_metrics.sample_count}",
+            )
     console.print()
 
     _rule("Suite Results")
@@ -115,7 +130,9 @@ def render_run_summary(run: BenchmarkRun) -> None:
     _summary_rule("Summary")
     console.print()
     if run.is_remote:
-        speed_label = f"{run.speed_score:.1f}" if run.speed_score > 0 else "N/A (no stream)"
+        speed_label = (
+            f"{run.speed_score:.1f}" if run.speed_score > 0 else "N/A (no stream)"
+        )
         rows: list[tuple[str, Any]] = [
             ("QUALITY", run.quality_score),
             ("SPEED", speed_label),
@@ -124,11 +141,17 @@ def render_run_summary(run: BenchmarkRun) -> None:
         ]
         for label, val in rows:
             if isinstance(val, str):
-                console.print(f"  [{ACCENT}]{label:<14}[/{ACCENT}][{DIM}]│[/{DIM}]  [{DIM}]{val}[/{DIM}]")
+                console.print(
+                    f"  [{ACCENT}]{label:<14}[/{ACCENT}][{DIM}]│[/{DIM}]  [{DIM}]{val}[/{DIM}]"
+                )
             else:
-                console.print(f"  [{ACCENT}]{label:<14}[/{ACCENT}][{DIM}]│[/{DIM}]  {val:.1f}")
+                console.print(
+                    f"  [{ACCENT}]{label:<14}[/{ACCENT}][{DIM}]│[/{DIM}]  {val:.1f}"
+                )
         if run.speed_metrics.ttft_ms > 0:
-            console.print(f"  [{DIM}]TTFT: {run.speed_metrics.ttft_ms:.0f}ms | tok/s: {run.speed_metrics.generation_tok_per_sec:.1f}[/{DIM}]")
+            console.print(
+                f"  [{DIM}]TTFT: {run.speed_metrics.ttft_ms:.0f}ms | tok/s: {run.speed_metrics.generation_tok_per_sec:.1f}[/{DIM}]"
+            )
     else:
         rows = [
             ("QUALITY", run.quality_score),
@@ -137,7 +160,9 @@ def render_run_summary(run: BenchmarkRun) -> None:
             ("VALUE", run.value_score),
         ]
         for label, val in rows:
-            console.print(f"  [{ACCENT}]{label:<14}[/{ACCENT}][{DIM}]│[/{DIM}]  {val:.1f}")
+            console.print(
+                f"  [{ACCENT}]{label:<14}[/{ACCENT}][{DIM}]│[/{DIM}]  {val:.1f}"
+            )
     console.print(f"  [{DIM}]{'─' * 24}[/{DIM}]")
     overall = run.overall_score
     badge = _score_badge(overall)
@@ -146,6 +171,8 @@ def render_run_summary(run: BenchmarkRun) -> None:
         f"  [{BOLD_ACCENT}]OVERALL       [/{BOLD_ACCENT}][{DIM}]│[/{DIM}]  [{style}]{overall:.1f}[/{style}]  {badge}"
     )
     console.print(f"\n  [{DIM}]Runtime: {run.total_runtime_sec:.1f}s[/{DIM}]")
+    if run.manifest_hash:
+        console.print(f"  [{DIM}]Manifest: {run.manifest_hash[:19]}…[/{DIM}]")
     console.print()
 
 

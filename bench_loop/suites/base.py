@@ -1,4 +1,5 @@
 """Base suite helpers."""
+
 from __future__ import annotations
 
 import time
@@ -33,9 +34,15 @@ class BenchmarkSuite:
             validation.setdefault("scenario_id", str(item.get("id", "")).upper())
 
             metadata = dict(item.get("metadata", {}))
-            capability_tags = list(item.get("capability_tags", metadata.get("capability_tags", [])) or [])
-            verifier_type = str(item.get("verifier_type", metadata.get("verifier_type", "")) or "")
-            difficulty = str(item.get("difficulty", metadata.get("difficulty", "")) or "")
+            capability_tags = list(
+                item.get("capability_tags", metadata.get("capability_tags", [])) or []
+            )
+            verifier_type = str(
+                item.get("verifier_type", metadata.get("verifier_type", "")) or ""
+            )
+            difficulty = str(
+                item.get("difficulty", metadata.get("difficulty", "")) or ""
+            )
             expected_turns = item.get("expected_turns", metadata.get("expected_turns"))
             notes = str(item.get("notes", metadata.get("notes", "")) or "")
             if capability_tags:
@@ -84,20 +91,28 @@ class BenchmarkSuite:
         )
         if max_tokens_override is not None:
             request["max_tokens"] = max_tokens_override
-        response = await provider_module.chat(
-            endpoint=endpoint,
-            model=model,
-            **request,
-        )
-        if harness is not None:
-            response = harness.postprocess(response, task)
+        started = self.now_ms()
+        try:
+            response = await provider_module.chat(
+                endpoint=endpoint,
+                model=model,
+                **request,
+            )
+            if harness is not None:
+                response = harness.postprocess(response, task)
+        except Exception as exc:  # noqa: BLE001 - captured as a reliability failure
+            response = self.runtime_error_response(exc, self.now_ms() - started)
         return self.evaluate(task, response)
 
     def evaluate(self, task: BenchmarkTask, response: dict[str, Any]) -> TaskResult:
         raise NotImplementedError
 
     def aggregate_score(self, task_results: list[TaskResult]) -> float:
-        return round(sum(task.score for task in task_results) / len(task_results), 2) if task_results else 0.0
+        return (
+            round(sum(task.score for task in task_results) / len(task_results), 2)
+            if task_results
+            else 0.0
+        )
 
     def normalize_text(self, text: str) -> str:
         return (
@@ -115,7 +130,9 @@ class BenchmarkSuite:
         return float(response.get("total_ms") or 0.0)
 
     def token_counts(self, response: dict[str, Any]) -> tuple[int, int]:
-        return int(response.get("tokens_generated") or 0), int(response.get("tokens_prompt") or 0)
+        return int(response.get("tokens_generated") or 0), int(
+            response.get("tokens_prompt") or 0
+        )
 
     def build_result(
         self,
@@ -129,6 +146,10 @@ class BenchmarkSuite:
         metadata: dict[str, Any] | None = None,
     ) -> TaskResult:
         tokens_generated, tokens_prompt = self.token_counts(response)
+        provider_error = str(response.get("error") or "").strip()
+        result_metadata = dict(metadata or {})
+        if provider_error:
+            result_metadata["provider_error"] = provider_error
         return TaskResult(
             task_id=task.id,
             suite=self.name,
@@ -137,10 +158,26 @@ class BenchmarkSuite:
             latency_ms=self.latency_ms(response),
             tokens_generated=tokens_generated,
             tokens_prompt=tokens_prompt,
-            error=error,
+            error=error or provider_error,
             output=output[:500],
-            metadata=metadata or {},
+            execution_ok=not bool(provider_error),
+            metadata=result_metadata,
         )
 
     def now_ms(self) -> float:
         return time.perf_counter() * 1000.0
+
+    def runtime_error_response(
+        self, exc: Exception, latency_ms: float
+    ) -> dict[str, Any]:
+        return {
+            "content": "",
+            "tool_calls": [],
+            "tokens_generated": 0,
+            "tokens_prompt": 0,
+            "total_ms": max(0.0, latency_ms),
+            "generation_tok_per_sec": 0.0,
+            "prompt_eval_tok_per_sec": 0.0,
+            "ttft_ms": 0.0,
+            "error": f"{type(exc).__name__}: {exc}",
+        }

@@ -26,6 +26,7 @@ Scoring (per task):
 Each criterion is worth 25 pts; total 100 per task. Average across tasks =
 suite score.
 """
+
 from __future__ import annotations
 
 import json
@@ -122,7 +123,12 @@ TOOL_SCHEMAS = {
             "description": "Evaluate a math expression. Supports +, -, *, /, %, parentheses.",
             "parameters": {
                 "type": "object",
-                "properties": {"expression": {"type": "string", "description": "Math expression to evaluate."}},
+                "properties": {
+                    "expression": {
+                        "type": "string",
+                        "description": "Math expression to evaluate.",
+                    }
+                },
                 "required": ["expression"],
             },
         },
@@ -136,7 +142,11 @@ TOOL_SCHEMAS = {
                 "type": "object",
                 "properties": {
                     "location": {"type": "string", "description": "City name."},
-                    "units": {"type": "string", "enum": ["fahrenheit", "celsius"], "default": "fahrenheit"},
+                    "units": {
+                        "type": "string",
+                        "enum": ["fahrenheit", "celsius"],
+                        "default": "fahrenheit",
+                    },
                 },
                 "required": ["location"],
             },
@@ -149,7 +159,12 @@ TOOL_SCHEMAS = {
             "description": "Get the latest stock price for a ticker symbol.",
             "parameters": {
                 "type": "object",
-                "properties": {"ticker": {"type": "string", "description": "Ticker symbol, e.g. AAPL."}},
+                "properties": {
+                    "ticker": {
+                        "type": "string",
+                        "description": "Ticker symbol, e.g. AAPL.",
+                    }
+                },
                 "required": ["ticker"],
             },
         },
@@ -207,7 +222,9 @@ def _needle_matches(needle: Any, final_lower: str, final_stripped: str) -> bool:
         return True
 
     # 2. Stripped match (handles "$3,948" containing "3948")
-    needle_stripped = needle_str.replace("$", "").replace(",", "").replace("€", "").replace("£", "")
+    needle_stripped = (
+        needle_str.replace("$", "").replace(",", "").replace("€", "").replace("£", "")
+    )
     if needle_stripped in final_stripped:
         return True
 
@@ -235,7 +252,7 @@ def _needle_matches(needle: Any, final_lower: str, final_stripped: str) -> bool:
 # --------------------------------------------------------------------------- #
 @dataclass
 class AgentTurn:
-    role: str            # "user" | "assistant" | "tool"
+    role: str  # "user" | "assistant" | "tool"
     content: str
     tool_calls: list[dict[str, Any]] | None = None
     tool_name: str | None = None
@@ -252,6 +269,11 @@ class AgentTrace:
     tool_calls_total: int
     hallucinated_tools: list[str]
     required_satisfied: bool
+    model_turns: int
+    latency_ms: float
+    tokens_generated: int
+    tokens_prompt: int
+    provider_errors: list[str]
 
 
 class AgentSuite(BenchmarkSuite):
@@ -277,11 +299,19 @@ class AgentSuite(BenchmarkSuite):
         final_lower = (trace.final_answer or "").lower()
         # Strip common numeric formatting ($, commas) for fuzzy matching.
         # This handles models that write "$3,948" when expected_contains has "3948".
-        final_stripped = final_lower.replace("$", "").replace(",", "").replace("€", "").replace("£", "")
-        correct_final = bool(expected_contains) and all(
-            _needle_matches(needle, final_lower, final_stripped) for needle in expected_contains
+        final_stripped = (
+            final_lower.replace("$", "")
+            .replace(",", "")
+            .replace("€", "")
+            .replace("£", "")
         )
-        efficient = trace.completed and len(trace.turns) <= max_turns * 2  # user+assistant per turn
+        correct_final = bool(expected_contains) and all(
+            _needle_matches(needle, final_lower, final_stripped)
+            for needle in expected_contains
+        )
+        efficient = (
+            trace.completed and len(trace.turns) <= max_turns * 2
+        )  # user+assistant per turn
         no_hallucination = len(trace.hallucinated_tools) == 0
         all_required_called = trace.required_satisfied
 
@@ -298,7 +328,13 @@ class AgentSuite(BenchmarkSuite):
             task=task,
             passed=passed,
             score=score,
-            response={"content": trace.final_answer},
+            response={
+                "content": trace.final_answer,
+                "total_ms": trace.latency_ms,
+                "tokens_generated": trace.tokens_generated,
+                "tokens_prompt": trace.tokens_prompt,
+                "error": "; ".join(trace.provider_errors),
+            },
             output=trace.final_answer[:500],
             metadata={
                 "agent_components": components,
@@ -317,6 +353,8 @@ class AgentSuite(BenchmarkSuite):
                 "completed": trace.completed,
                 "stop_reason": trace.stop_reason,
                 "max_turns": max_turns,
+                "model_turns": trace.model_turns,
+                "provider_errors": trace.provider_errors,
             },
         )
 
@@ -338,16 +376,22 @@ class AgentSuite(BenchmarkSuite):
         validation = task.validation or {}
         max_turns = int(validation.get("max_turns", self.DEFAULT_MAX_TURNS))
         allowed_tools = list(validation.get("tools", list(TOOL_SCHEMAS)))
-        required_calls = list(validation.get("must_call", []))  # [{"name": "...", "args_contains": {...}}]
+        required_calls = list(
+            validation.get("must_call", [])
+        )  # [{"name": "...", "args_contains": {...}}]
 
         # Build the tool definitions the model sees this run.
-        tool_schemas = [TOOL_SCHEMAS[name] for name in allowed_tools if name in TOOL_SCHEMAS]
+        tool_schemas = [
+            TOOL_SCHEMAS[name] for name in allowed_tools if name in TOOL_SCHEMAS
+        ]
 
         # Start the conversation with the task's first user turn.
         messages = [dict(m) for m in task.messages]
         turns: list[AgentTurn] = []
         for m in messages:
-            turns.append(AgentTurn(role=m.get("role", "user"), content=str(m.get("content", ""))))
+            turns.append(
+                AgentTurn(role=m.get("role", "user"), content=str(m.get("content", "")))
+            )
 
         hallucinated: list[str] = []
         tool_calls_total = 0
@@ -355,6 +399,11 @@ class AgentSuite(BenchmarkSuite):
         stop_reason = "max_turns"
         final_answer = ""
         completed = False
+        model_turns = 0
+        latency_ms = 0.0
+        tokens_generated = 0
+        tokens_prompt = 0
+        provider_errors: list[str] = []
 
         for turn_idx in range(max_turns):
             # Prepare a task-like wrapper so the harness can inject its
@@ -374,13 +423,27 @@ class AgentSuite(BenchmarkSuite):
                 else {"messages": messages, "tools": tool_schemas, "max_tokens": per_turn_max_tokens}
             )
 
-            response = await provider_module.chat(
-                endpoint=endpoint,
-                model=model,
-                **request,
-            )
-            if harness is not None:
-                response = harness.postprocess(response, synthetic_task)
+            started = self.now_ms()
+            try:
+                response = await provider_module.chat(
+                    endpoint=endpoint,
+                    model=model,
+                    **request,
+                )
+                if harness is not None:
+                    response = harness.postprocess(response, synthetic_task)
+            except Exception as exc:  # preserve the trace and reliability signal
+                response = self.runtime_error_response(exc, self.now_ms() - started)
+
+            model_turns += 1
+            latency_ms += float(response.get("total_ms") or 0.0)
+            tokens_generated += int(response.get("tokens_generated") or 0)
+            tokens_prompt += int(response.get("tokens_prompt") or 0)
+            provider_error = str(response.get("error") or "").strip()
+            if provider_error:
+                provider_errors.append(provider_error)
+                stop_reason = "provider_error"
+                break
 
             content = (response.get("content") or "").strip()
             tool_calls = response.get("tool_calls") or []
@@ -432,9 +495,13 @@ class AgentSuite(BenchmarkSuite):
                     (
                         {
                             "function": {
-                                "name": (call.get("function") or {}).get("name") if isinstance(call, dict) else "",
+                                "name": (call.get("function") or {}).get("name")
+                                if isinstance(call, dict)
+                                else "",
                                 "arguments": _serialize_args(
-                                    (call.get("function") or {}).get("arguments", {}) if isinstance(call, dict) else {}
+                                    (call.get("function") or {}).get("arguments", {})
+                                    if isinstance(call, dict)
+                                    else {}
                                 ),
                             },
                         }
@@ -443,9 +510,13 @@ class AgentSuite(BenchmarkSuite):
                             "id": f"call_{turn_idx}_{i}",
                             "type": "function",
                             "function": {
-                                "name": (call.get("function") or {}).get("name") if isinstance(call, dict) else "",
+                                "name": (call.get("function") or {}).get("name")
+                                if isinstance(call, dict)
+                                else "",
                                 "arguments": _serialize_args(
-                                    (call.get("function") or {}).get("arguments", "{}") if isinstance(call, dict) else "{}"
+                                    (call.get("function") or {}).get("arguments", "{}")
+                                    if isinstance(call, dict)
+                                    else "{}"
                                 ),
                             },
                         }
@@ -476,22 +547,29 @@ class AgentSuite(BenchmarkSuite):
                     try:
                         tool_result = TOOL_IMPL[name](args)
                     except Exception as exc:
-                        tool_result = f"ERROR: tool execution failed: {type(exc).__name__}: {exc}"
+                        tool_result = (
+                            f"ERROR: tool execution failed: {type(exc).__name__}: {exc}"
+                        )
 
                 # Track required calls
                 for req in required_calls:
                     if req.get("name") == name:
                         wanted_args = req.get("args_contains", {})
-                        if all(str(args.get(k, "")).lower().find(str(v).lower()) >= 0 for k, v in wanted_args.items()):
+                        if all(
+                            str(args.get(k, "")).lower().find(str(v).lower()) >= 0
+                            for k, v in wanted_args.items()
+                        ):
                             required_seen.add(name)
 
-                turns.append(AgentTurn(
-                    role="tool",
-                    content=tool_result,
-                    tool_name=name,
-                    tool_args=args,
-                    tool_result=tool_result,
-                ))
+                turns.append(
+                    AgentTurn(
+                        role="tool",
+                        content=tool_result,
+                        tool_name=name,
+                        tool_args=args,
+                        tool_result=tool_result,
+                    )
+                )
                 tool_message: dict[str, Any] = {
                     "role": "tool",
                     "name": name,
@@ -505,9 +583,9 @@ class AgentSuite(BenchmarkSuite):
             # for/else: ran out of turns
             stop_reason = "max_turns_exceeded"
 
-        required_satisfied = (
-            len(required_calls) == 0 or {r.get("name") for r in required_calls}.issubset(required_seen)
-        )
+        required_satisfied = len(required_calls) == 0 or {
+            r.get("name") for r in required_calls
+        }.issubset(required_seen)
 
         trace = AgentTrace(
             turns=turns,
@@ -517,6 +595,11 @@ class AgentSuite(BenchmarkSuite):
             tool_calls_total=tool_calls_total,
             hallucinated_tools=hallucinated,
             required_satisfied=required_satisfied,
+            model_turns=model_turns,
+            latency_ms=latency_ms,
+            tokens_generated=tokens_generated,
+            tokens_prompt=tokens_prompt,
+            provider_errors=provider_errors,
         )
 
         return self.evaluate(task, {"__trace": trace})

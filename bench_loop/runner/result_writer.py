@@ -1,4 +1,5 @@
 """Persist benchmark results."""
+
 from __future__ import annotations
 
 import json
@@ -11,9 +12,17 @@ from urllib.parse import urlparse
 import httpx
 from rich.console import Console
 
+from bench_loop.benchmark_manifest import (
+    BENCHMARK_ID,
+    BENCHMARK_VERSION,
+    DEFAULT_PROFILE,
+    SCORE_SCHEMA_VERSION,
+    classify_suites,
+    profile_coverage,
+    resolve_suites,
+)
 from bench_loop.hardware import detect_hardware
 from bench_loop.models import BenchmarkRun
-
 
 RUNS_DIR = Path.home() / ".bench-loop" / "runs"
 
@@ -21,16 +30,27 @@ RUNS_DIR = Path.home() / ".bench-loop" / "runs"
 LEADERBOARD_SUBMIT_URL = os.environ.get(
     "BENCHLOOP_SUBMIT_URL", "https://api.bench-loop.com/submit"
 )
-_SUBMIT_DISABLED = os.environ.get("BENCHLOOP_NO_SUBMIT", "").lower() in {"1", "true", "yes"}
+_SUBMIT_DISABLED = os.environ.get("BENCHLOOP_NO_SUBMIT", "").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 
 
 def _coalesce_profile(publish_profile: dict | None = None) -> dict[str, str]:
     raw = {
-        "name": (publish_profile or {}).get("name") or os.environ.get("BENCHLOOP_PROFILE_NAME", ""),
-        "avatar_url": (publish_profile or {}).get("avatar_url") or os.environ.get("BENCHLOOP_PROFILE_AVATAR_URL", ""),
-        "profile_url": (publish_profile or {}).get("profile_url") or os.environ.get("BENCHLOOP_PROFILE_URL", ""),
+        "name": (publish_profile or {}).get("name")
+        or os.environ.get("BENCHLOOP_PROFILE_NAME", ""),
+        "avatar_url": (publish_profile or {}).get("avatar_url")
+        or os.environ.get("BENCHLOOP_PROFILE_AVATAR_URL", ""),
+        "profile_url": (publish_profile or {}).get("profile_url")
+        or os.environ.get("BENCHLOOP_PROFILE_URL", ""),
     }
-    return {key: str(value).strip() for key, value in raw.items() if str(value or "").strip()}
+    return {
+        key: str(value).strip()
+        for key, value in raw.items()
+        if str(value or "").strip()
+    }
 
 
 def _submit_to_leaderboard(payload: dict, console: Console) -> None:
@@ -47,7 +67,7 @@ def _submit_to_leaderboard(payload: dict, console: Console) -> None:
             resp = client.post(LEADERBOARD_SUBMIT_URL, json=payload)
             if resp.status_code == 200:
                 console.print(
-                    f"[dim green]→ published to https://bench-loop.com/leaderboard[/dim green]"
+                    "[dim green]→ published to https://bench-loop.com/leaderboard[/dim green]"
                 )
             else:
                 console.print(
@@ -87,7 +107,10 @@ def save_run(
     console = console or Console()
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     endpoint_id = _endpoint_identifier(endpoint)
-    run_dir = RUNS_DIR / f"{timestamp}-{_slugify(run.model.model_id)}-{endpoint_id}-{_slugify(run.provider)}"
+    run_dir = (
+        RUNS_DIR
+        / f"{timestamp}-{_slugify(run.model.model_id)}-{endpoint_id}-{_slugify(run.provider)}"
+    )
     run_dir.mkdir(parents=True, exist_ok=True)
 
     output_path = run_dir / "run.json"
@@ -116,7 +139,7 @@ def save_failed_run(
     endpoint: str,
     provider: str,
     harness: str,
-    suites: list[str],
+    suites: list[str] | None,
     error: str,
     traceback_text: str | None = None,
     events: list[dict] | None = None,
@@ -124,14 +147,24 @@ def save_failed_run(
     command_used: str | None = None,
     console: Console | None = None,
     user_id: str | None = None,
+    benchmark_profile: str = DEFAULT_PROFILE,
 ) -> Path:
     console = console or Console()
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     endpoint_id = _endpoint_identifier(endpoint)
-    run_dir = RUNS_DIR / f"{timestamp}-{_slugify(model)}-{endpoint_id}-{_slugify(provider)}-failed"
+    run_dir = (
+        RUNS_DIR
+        / f"{timestamp}-{_slugify(model)}-{endpoint_id}-{_slugify(provider)}-failed"
+    )
     run_dir.mkdir(parents=True, exist_ok=True)
 
     machine = detect_hardware(endpoint=endpoint)
+    requested_suites = resolve_suites(benchmark_profile, suites)
+    classified_profile = classify_suites(requested_suites)
+    coverage_profile = (
+        classified_profile if classified_profile != "custom" else benchmark_profile
+    )
+    coverage = profile_coverage(coverage_profile, requested_suites)
     run_dict = {
         "run_id": run_id,
         "status": "failed",
@@ -145,7 +178,15 @@ def save_failed_run(
         "machine": machine,
         "provider": provider,
         "harness": harness,
-        "requested_suites": suites,
+        "requested_suites": requested_suites,
+        "benchmark_id": BENCHMARK_ID,
+        "benchmark_version": BENCHMARK_VERSION,
+        "benchmark_profile": classified_profile,
+        "requested_profile": benchmark_profile,
+        "score_schema_version": SCORE_SCHEMA_VERSION,
+        "manifest_hash": "",
+        "coverage_score": coverage,
+        "comparable": False,
         "suites": {},
         "overall_score": 0,
         "quality_score": 0,
