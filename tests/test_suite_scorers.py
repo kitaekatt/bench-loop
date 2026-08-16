@@ -58,6 +58,27 @@ def test_dataextract_atomic_field_golden_scores() -> None:
     assert invalid.score == 0
 
 
+def test_dataextract_recovers_json_without_relaxing_field_scoring() -> None:
+    task = _task(
+        "de-golden",
+        "dataextract",
+        validation={"expected": {"name": "Ada", "age": 36}, "scenario_id": "DE-GOLDEN"},
+    )
+    fenced = DataExtractSuite().evaluate(
+        task,
+        {"content": 'Result:\n```json\n{"name":"Ada","age":36}\n```'},
+    )
+    prose_wrapped = DataExtractSuite().evaluate(
+        task,
+        {"content": 'The extracted record is {"name":"Ada","age":99}.'},
+    )
+
+    assert fenced.score == 100
+    assert fenced.metadata["json_extraction_method"] == "fenced"
+    assert prose_wrapped.score == 50
+    assert prose_wrapped.metadata["json_extraction_method"] == "bracket_scan"
+
+
 def test_instruction_following_golden_scores() -> None:
     task = _task("if-02", "instructfollow")
     exact = InstructFollowSuite().evaluate(

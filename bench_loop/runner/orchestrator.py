@@ -59,6 +59,7 @@ async def run_benchmark(
     timeout_sec: float | None = None,  # accepted but unused
     remote: bool | None = None,  # None=auto, False=local hardware, True=cloud
     profile: str = DEFAULT_PROFILE,
+    max_tokens: int | None = None,  # override every task's fixture max_tokens
 ) -> BenchmarkRun:
     # API back-compat: allow `run_benchmark(config)` where config has
     # the same attributes (model/endpoint/provider/suite_names/harness/...).
@@ -77,6 +78,7 @@ async def run_benchmark(
         cfg_remote = getattr(cfg, "remote", None)
         if cfg_remote is not None:
             remote = bool(cfg_remote)
+        max_tokens = getattr(cfg, "max_tokens", None) or max_tokens
     elif suite_names and not suites:
         suites = suite_names
 
@@ -203,6 +205,7 @@ async def run_benchmark(
         task_results: list[TaskResult] = []
         for task in tasks:
             if suite_name == "speed":
+                # Speed fixtures use deliberately tiny caps to measure raw throughput — never override.
                 result = await _run_speed_task(
                     provider_module,
                     endpoint,
@@ -222,6 +225,7 @@ async def run_benchmark(
                     task,
                     harness=harness_adapter,
                     provider_name=provider,
+                    max_tokens_override=max_tokens,
                 )
             task_results.append(result)
             speed_meta = (

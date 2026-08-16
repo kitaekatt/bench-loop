@@ -7,6 +7,7 @@ from bench_loop.runner import orchestrator
 
 class _FakeProvider:
     calls = 0
+    requests: list[dict] = []
 
     @staticmethod
     async def list_models(_endpoint: str) -> list[str]:
@@ -17,8 +18,9 @@ class _FakeProvider:
         return {"endpoint": endpoint}
 
     @classmethod
-    async def chat(cls, **_kwargs) -> dict:
+    async def chat(cls, **kwargs) -> dict:
         cls.calls += 1
+        cls.requests.append(kwargs)
         return {
             "content": "benchmark output",
             "tokens_prompt": 20,
@@ -32,6 +34,7 @@ class _FakeProvider:
 
 def test_orchestrator_stamps_provenance_and_trial_distribution(monkeypatch) -> None:
     _FakeProvider.calls = 0
+    _FakeProvider.requests = []
     monkeypatch.setitem(orchestrator.PROVIDER_REGISTRY, "fake", _FakeProvider)
     run = asyncio.run(
         orchestrator.run_benchmark(
@@ -62,3 +65,26 @@ def test_orchestrator_stamps_provenance_and_trial_distribution(monkeypatch) -> N
         assert task.metadata["warmup_dropped"] is True
         assert len(task.metadata["trials"]) == 2
         assert task.metadata["speed_mode"] == "local"
+
+
+def test_quality_token_override_never_changes_speed_fixture_caps(monkeypatch) -> None:
+    _FakeProvider.calls = 0
+    _FakeProvider.requests = []
+    monkeypatch.setitem(orchestrator.PROVIDER_REGISTRY, "fake", _FakeProvider)
+
+    asyncio.run(
+        orchestrator.run_benchmark(
+            model="fake-model",
+            endpoint="http://localhost:8080",
+            provider="fake",
+            suites=["speed"],
+            runs=1,
+            max_tokens=8192,
+            remote=False,
+        )
+    )
+
+    # The first call is the global warmup. Every subsequent call must retain
+    # the speed task's own small generation cap instead of the quality override.
+    speed_caps = [request["max_tokens"] for request in _FakeProvider.requests[1:]]
+    assert speed_caps == [32, 48, 64, 160, 160, 160, 384, 384, 384]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path as FsPath
@@ -404,7 +405,9 @@ async def get_run(run_id: str):
     """Get detailed run result."""
     # Check active runs first
     if run_id in _active_runs:
-        return _active_runs[run_id]
+        state = dict(_active_runs[run_id])
+        state.pop("task", None)
+        return state
 
     # Check disk
     run_dir = RUNS_DIR / run_id
@@ -438,3 +441,27 @@ async def get_run(run_id: str):
         "result": data,
         "hardware": hw_data,
     }
+
+
+@router.delete("/benchmark/runs/{run_id}")
+async def delete_run(run_id: str):
+    """Delete a persisted local benchmark run."""
+    state = _active_runs.get(run_id)
+    if state and state.get("status") not in ("completed", "failed", "cancelled"):
+        raise HTTPException(
+            status_code=409, detail="Cannot delete an active run. Cancel it first."
+        )
+
+    runs_root = RUNS_DIR.resolve()
+    run_dir = (RUNS_DIR / run_id).resolve()
+    if run_dir.parent != runs_root:
+        raise HTTPException(status_code=400, detail="Invalid run id")
+
+    if not run_dir.exists():
+        raise HTTPException(status_code=404, detail="Run not found")
+    if not run_dir.is_dir():
+        raise HTTPException(status_code=400, detail="Run path is not a directory")
+
+    shutil.rmtree(run_dir)
+    _active_runs.pop(run_id, None)
+    return {"ok": True, "run_id": run_id}
