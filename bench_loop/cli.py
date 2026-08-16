@@ -1,4 +1,5 @@
 """BenchLoop CLI."""
+
 from __future__ import annotations
 
 import asyncio
@@ -11,12 +12,19 @@ from pathlib import Path
 import click
 
 from bench_loop import __version__
+from bench_loop.benchmark_manifest import DEFAULT_PROFILE, PROFILES, classify_suites
 from bench_loop.harness import list_harnesses
 from bench_loop.report.console import print_run_report
-from bench_loop.runner.orchestrator import DEFAULT_SUITES, SUITE_REGISTRY, run_benchmark
+from bench_loop.runner.orchestrator import (
+    SUITE_REGISTRY,
+    endpoint_is_cloud,
+    run_benchmark,
+)
 from bench_loop.runner.result_writer import save_run
 
-RUNS_DIR = Path(os.environ.get("BENCHLOOP_RUNS", Path.home() / ".bench-loop" / "runs")).expanduser()
+RUNS_DIR = Path(
+    os.environ.get("BENCHLOOP_RUNS", Path.home() / ".bench-loop" / "runs")
+).expanduser()
 
 
 @click.group(help="BenchLoop local LLM benchmarking CLI.")
@@ -33,7 +41,7 @@ class SuiteSummary:
 
 async def _suite_summaries() -> list[SuiteSummary]:
     summaries: list[SuiteSummary] = []
-    for suite_name, suite_cls in SUITE_REGISTRY.items():
+    for suite_cls in SUITE_REGISTRY.values():
         suite = suite_cls()
         tasks = await suite.load_tasks()
         summaries.append(SuiteSummary(name=suite.name, task_count=len(tasks)))
@@ -49,6 +57,11 @@ def info() -> None:
     click.echo("\nSupported suites:")
     for summary in summaries:
         click.echo(f"  {summary.name}: {summary.task_count} tasks")
+    counts = {summary.name: summary.task_count for summary in summaries}
+    click.echo("\nBenchmark profiles:")
+    for profile in PROFILES.values():
+        task_count = sum(counts.get(suite, 0) for suite in profile.suites)
+        click.echo(f"  {profile.name}: {task_count} tasks — {profile.description}")
     click.echo("\nAvailable harnesses:")
     for harness_name in list_harnesses():
         click.echo(f"  {harness_name}")
@@ -56,13 +69,34 @@ def info() -> None:
 
 @main.command()
 @click.option("--model", required=True, help="Model name to benchmark.")
-@click.option("--endpoint", default="http://localhost:11434", show_default=True, help="Provider endpoint URL.")
-@click.option("--provider", default="ollama", show_default=True, help="Provider backend.")
+@click.option(
+    "--endpoint",
+    default="http://localhost:11434",
+    show_default=True,
+    help="Provider endpoint URL.",
+)
+@click.option(
+    "--provider", default="ollama", show_default=True, help="Provider backend."
+)
+@click.option(
+    "--profile",
+    "benchmark_profile",
+    type=click.Choice(list(PROFILES), case_sensitive=False),
+    default=DEFAULT_PROFILE,
+    show_default=True,
+    help="Versioned benchmark profile. --suites overrides its suite selection.",
+)
 @click.option(
     "--suites",
-    default=",".join(DEFAULT_SUITES),
+    default=None,
+    help="Custom comma-separated suite list. Such runs are labeled custom unless they exactly match a profile.",
+)
+@click.option(
+    "--trials",
+    default=3,
     show_default=True,
-    help="Comma-separated suite list.",
+    type=click.IntRange(1, 20),
+    help="Speed trials per prompt; the first is warmup when trials > 1.",
 )
 @click.option(
     "--harness",
@@ -110,7 +144,14 @@ def info() -> None:
     "--remote",
     is_flag=True,
     default=False,
-    help="Mark as remote/cloud benchmark. Skips local speed scoring (tok/s) since cloud inference throughput isn't comparable to local hardware.",
+    help="Mark as remote/cloud benchmark and use streaming TTFT plus the cloud-aware speed curve.",
+)
+@click.option(
+    "--local",
+    "force_local",
+    is_flag=True,
+    default=False,
+    help="Force the local-hardware speed curve for LAN, SSH-tunnel, or Tailscale endpoints.",
 )
 @click.option(
     "--api-key",
@@ -121,7 +162,9 @@ def run(
     model: str,
     endpoint: str,
     provider: str,
-    suites: str,
+    benchmark_profile: str,
+    suites: str | None,
+    trials: int,
     harness: str,
     hardware: str | None,
     gpu: str | None,
@@ -131,6 +174,7 @@ def run(
     profile_url: str | None,
     command_used: str | None,
     remote: bool,
+    force_local: bool,
     api_key: str | None,
 ) -> None:
     """Run a benchmark."""
@@ -143,25 +187,23 @@ def run(
     if provider == "ollama":
         try:
             from urllib.parse import urlparse
+
             port = urlparse(endpoint).port
             if port in {1234, 1337, 5001, 8000, 8080, 8081}:
                 provider = "openai_compat"
-                click.echo(f"[auto-detected provider=openai_compat from port {port}]", err=True)
+                click.echo(
+                    f"[auto-detected provider=openai_compat from port {port}]", err=True
+                )
         except Exception:
             pass
 
-    # Auto-detect cloud endpoints if --remote not explicitly set
-    if not remote:
-        try:
-            from urllib.parse import urlparse
-            parsed = urlparse(endpoint)
-            hostname = parsed.hostname or ""
-            # If not localhost/127.0.0.1/::1, assume cloud
-            if hostname and hostname not in ("localhost", "127.0.0.1", "::1", ""):
-                remote = True
-                click.echo(f"[auto-detected cloud endpoint: {hostname}]", err=True)
-        except Exception:
-            pass
+    if remote and force_local:
+        raise click.UsageError("--remote and --local are mutually exclusive")
+    if not remote and not force_local and endpoint_is_cloud(endpoint):
+        remote = True
+        click.echo(
+            "[auto-detected hosted/cloud endpoint; use --local to override]", err=True
+        )
 
     # Surface CLI hardware overrides to detect_hardware() via env vars so the
     # whole detection pipeline picks them up without threading another arg.
@@ -177,30 +219,40 @@ def run(
         "avatar_url": profile_avatar_url,
         "profile_url": profile_url,
     }
-    command_used = (command_used or os.environ.get("BENCHLOOP_COMMAND_USED") or "").strip() or None
+    command_used = (
+        command_used or os.environ.get("BENCHLOOP_COMMAND_USED") or ""
+    ).strip() or None
 
-    selected_suites = [item.strip() for item in suites.split(",") if item.strip()]
-    
+    selected_suites = (
+        [item.strip() for item in suites.split(",") if item.strip()]
+        if suites is not None
+        else None
+    )
+
     # Progress callback for CLI output
     import time
+
     start_time = time.time()
     total_tasks = 0
     completed_tasks = 0
-    
+
     def on_progress(event: dict) -> None:
         nonlocal total_tasks, completed_tasks
         event_type = event.get("type")
-        
+
         if event_type == "run_started":
             total_tasks = event.get("total_tasks", 0)
             suite_names = event.get("suites", [])
-            click.echo(f"\n🚀 Starting benchmark: {len(suite_names)} suites, {total_tasks} tasks total", err=True)
-        
+            click.echo(
+                f"\n🚀 Starting benchmark: {len(suite_names)} suites, {total_tasks} tasks total",
+                err=True,
+            )
+
         elif event_type == "suite_started":
             suite = event.get("suite", "")
             task_count = event.get("task_count", 0)
             click.echo(f"\n📊 [{suite}] Running {task_count} tasks...", err=True)
-        
+
         elif event_type == "task_completed":
             completed_tasks = event.get("completed_tasks", 0)
             suite = event.get("suite", "")
@@ -208,33 +260,46 @@ def run(
             passed = event.get("passed", False)
             score = event.get("score", 0)
             latency = event.get("latency_ms", 0)
-            
+
             # Progress bar
             progress = completed_tasks / total_tasks if total_tasks > 0 else 0
             bar_width = 30
             filled = int(bar_width * progress)
             bar = "█" * filled + "░" * (bar_width - filled)
-            
+
             # ETA calculation
             elapsed = time.time() - start_time
-            eta = (elapsed / completed_tasks * (total_tasks - completed_tasks)) if completed_tasks > 0 else 0
+            eta = (
+                (elapsed / completed_tasks * (total_tasks - completed_tasks))
+                if completed_tasks > 0
+                else 0
+            )
             eta_str = f"{int(eta // 60)}m {int(eta % 60)}s" if eta > 0 else "--"
-            
+
             status = "✓" if passed else "✗"
-            click.echo(f"  [{bar}] {completed_tasks}/{total_tasks} {status} {task_id[:30]:<30} score={score:.0f} {latency/1000:.1f}s ETA={eta_str}", err=True)
-        
+            click.echo(
+                f"  [{bar}] {completed_tasks}/{total_tasks} {status} {task_id[:30]:<30} score={score:.0f} {latency / 1000:.1f}s ETA={eta_str}",
+                err=True,
+            )
+
         elif event_type == "suite_completed":
             suite = event.get("suite", "")
             score = event.get("score", 0)
             pass_count = event.get("pass_count", 0)
             task_count = event.get("task_count", 0)
-            click.echo(f"  ✅ {suite}: {score:.1f}/100 ({pass_count}/{task_count} passed)", err=True)
-        
+            click.echo(
+                f"  ✅ {suite}: {score:.1f}/100 ({pass_count}/{task_count} passed)",
+                err=True,
+            )
+
         elif event_type == "run_completed":
             overall = event.get("overall_score", 0)
             runtime = event.get("total_runtime_sec", 0)
-            click.echo(f"\n🎉 Benchmark complete! Overall: {overall:.1f}/100 in {runtime:.1f}s", err=True)
-    
+            click.echo(
+                f"\n🎉 Benchmark complete! Overall: {overall:.1f}/100 in {runtime:.1f}s",
+                err=True,
+            )
+
     try:
         benchmark = asyncio.run(
             run_benchmark(
@@ -245,6 +310,8 @@ def run(
                 harness=harness,
                 remote=remote,
                 on_progress=on_progress,
+                profile=benchmark_profile,
+                runs=trials,
             )
         )
     except ValueError as exc:
@@ -257,12 +324,19 @@ def run(
             click.echo("      LM Studio: launch app, enable local server", err=True)
             click.echo("  • Pull a model first, e.g.:", err=True)
             click.echo("      ollama pull qwen3:1.7b", err=True)
-            click.echo("  • If your endpoint isn't Ollama, pass --provider openai_compat", err=True)
-            click.echo("  • Or launch the dashboard which auto-discovers models:", err=True)
+            click.echo(
+                "  • If your endpoint isn't Ollama, pass --provider openai_compat",
+                err=True,
+            )
+            click.echo(
+                "  • Or launch the dashboard which auto-discovers models:", err=True
+            )
             click.echo("      benchloop dashboard", err=True)
         raise SystemExit(1)
     except ConnectionError as exc:
-        click.secho(f"\n✗ Could not reach endpoint {endpoint}: {exc}\n", fg="red", err=True)
+        click.secho(
+            f"\n✗ Could not reach endpoint {endpoint}: {exc}\n", fg="red", err=True
+        )
         click.echo("Is your local LLM server running?", err=True)
         raise SystemExit(1)
     except Exception as exc:  # noqa: BLE001
@@ -271,22 +345,37 @@ def run(
         # Python traceback.
         type_name = type(exc).__name__
         msg = str(exc)
-        click.secho(f"\n✗ Benchmark failed ({type_name}): {msg or 'no message'}\n", fg="red", err=True)
-        if type_name in {"ConnectError", "ConnectionRefusedError", "ConnectionError"} or "connection" in msg.lower():
+        click.secho(
+            f"\n✗ Benchmark failed ({type_name}): {msg or 'no message'}\n",
+            fg="red",
+            err=True,
+        )
+        if (
+            type_name in {"ConnectError", "ConnectionRefusedError", "ConnectionError"}
+            or "connection" in msg.lower()
+        ):
             click.echo(f"Could not reach endpoint {endpoint}.", err=True)
             click.echo("Tips:", err=True)
             click.echo("  • Start your local LLM server:", err=True)
             click.echo("      Ollama:    ollama serve", err=True)
             click.echo("      LM Studio: launch app, enable local server", err=True)
             click.echo("  • Verify the endpoint URL and port are right.", err=True)
-            click.echo("  • If your endpoint isn't Ollama, pass --provider openai_compat", err=True)
+            click.echo(
+                "  • If your endpoint isn't Ollama, pass --provider openai_compat",
+                err=True,
+            )
         elif "500" in msg or "Internal Server Error" in msg:
             click.echo("The provider returned HTTP 500. Common causes:", err=True)
             click.echo("  • Model context window exceeded for this prompt", err=True)
-            click.echo("  • GPU OOM (try a smaller model or close other models)", err=True)
+            click.echo(
+                "  • GPU OOM (try a smaller model or close other models)", err=True
+            )
             click.echo("  • Ollama crashed (check `ollama serve` logs)", err=True)
         elif "timeout" in msg.lower() or type_name == "ReadTimeout":
-            click.echo("Timeout. Try a smaller model, fewer suites, or check network stability.", err=True)
+            click.echo(
+                "Timeout. Try a smaller model, fewer suites, or check network stability.",
+                err=True,
+            )
         raise SystemExit(1)
     print_run_report(benchmark)
     save_run(
@@ -306,15 +395,24 @@ def suites() -> None:
 
 
 @main.command()
-@click.option("--output", "-o", default=None, help="Path to write the leaderboard JSON. Defaults to stdout.")
-@click.option("--all", "include_all", is_flag=True, help="Include partial runs (default: only full benchmarks).")
+@click.option(
+    "--output",
+    "-o",
+    default=None,
+    help="Path to write the leaderboard JSON. Defaults to stdout.",
+)
+@click.option(
+    "--all",
+    "include_all",
+    is_flag=True,
+    help="Include partial runs (default: named profiles and legacy complete runs).",
+)
 def export(output: str | None, include_all: bool) -> None:
     """Export local runs to a leaderboard-compatible JSON.
 
     The output format matches the schema consumed by https://bench-loop.com/leaderboard
     so you can submit your own runs via PR.
     """
-    REQUIRED_FULL = {"speed", "toolcall", "dataextract", "instructfollow", "reasonmath"}
     REQUIRED_QUALITY = {"toolcall", "dataextract", "instructfollow", "reasonmath"}
 
     if not RUNS_DIR.exists():
@@ -334,11 +432,13 @@ def export(output: str | None, include_all: bool) -> None:
 
         suite_map = data.get("suites") or {}
         suite_names = set(suite_map.keys())
-        is_full = REQUIRED_FULL.issubset(suite_names)
+        run_profile = data.get("benchmark_profile") or classify_suites(suite_names)
+        is_full = run_profile == "full"
+        is_core = run_profile == "core"
         is_quality = REQUIRED_QUALITY.issubset(suite_names)
         is_agent_only = suite_names == {"agent"}
 
-        if not include_all and not (is_full or is_quality or is_agent_only):
+        if not include_all and not (is_full or is_core or is_quality or is_agent_only):
             continue
 
         model_id = (data.get("model") or {}).get("model_id", "unknown")
@@ -352,15 +452,18 @@ def export(output: str | None, include_all: bool) -> None:
             "harness": data.get("harness", "raw"),
             "provider": data.get("provider", ""),
             "machine": (data.get("machine") or {}).get("gpu")
-                or (data.get("machine") or {}).get("cpu")
-                or (data.get("machine") or {}).get("machine_id", ""),
+            or (data.get("machine") or {}).get("cpu")
+            or (data.get("machine") or {}).get("machine_id", ""),
             "overall_score": data.get("overall_score", 0),
             "quality_score": data.get("quality_score", 0),
             "speed_score": data.get("speed_score", 0),
             "reliability_score": data.get("reliability_score", 0),
-            "generation_tok_per_sec": (data.get("speed_metrics") or {}).get("generation_tok_per_sec", 0),
+            "generation_tok_per_sec": (data.get("speed_metrics") or {}).get(
+                "generation_tok_per_sec", 0
+            ),
             "ttft_ms": (data.get("speed_metrics") or {}).get("ttft_ms", 0),
             "is_full_benchmark": is_full,
+            "is_core_benchmark": is_core,
             "is_quality_full": is_quality,
             "is_agent_only": is_agent_only,
             "agent_score": (suite_map.get("agent") or {}).get("score"),
@@ -369,7 +472,16 @@ def export(output: str | None, include_all: bool) -> None:
             "profile_name": ((data.get("profile") or {}).get("name") or ""),
             "profile_avatar_url": ((data.get("profile") or {}).get("avatar_url") or ""),
             "profile_url": ((data.get("profile") or {}).get("profile_url") or ""),
-            "suites": {name: {"score": s.get("score", 0)} for name, s in suite_map.items()},
+            "suites": {
+                name: {"score": s.get("score", 0)} for name, s in suite_map.items()
+            },
+            "benchmark_id": data.get("benchmark_id", "benchloop-legacy"),
+            "benchmark_version": data.get("benchmark_version", "legacy"),
+            "benchmark_profile": run_profile,
+            "score_schema_version": data.get("score_schema_version", "legacy"),
+            "manifest_hash": data.get("manifest_hash", ""),
+            "coverage_score": data.get("coverage_score", 0),
+            "comparable": data.get("comparable", is_full or is_core),
         }
 
         # Keep best run per model+harness.
@@ -379,7 +491,9 @@ def export(output: str | None, include_all: bool) -> None:
             rows[key] = row
 
     payload = {
-        "generated_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+        "generated_at": __import__("datetime")
+        .datetime.now(__import__("datetime").timezone.utc)
+        .isoformat(),
         "count": len(rows),
         "source": "benchloop export",
         "runs": sorted(rows.values(), key=lambda r: r["overall_score"], reverse=True),
@@ -394,18 +508,46 @@ def export(output: str | None, include_all: bool) -> None:
 
 @main.command()
 @click.option("--host", default="127.0.0.1", show_default=True)
-@click.option("--port", "port", default=8877, show_default=True, type=int, help="Port for the dashboard (API + UI).")
-@click.option("--api-port", default=None, type=int, help="DEPRECATED. Same as --port; kept for compatibility.")
-@click.option("--ui-port", default=None, type=int, help="DEPRECATED. UI is now served by the API.")
-@click.option("--api-only", is_flag=True, help="Legacy flag, no-op now that UI is bundled.")
-@click.option("--dev/--no-dev", default=False, help="Use the sibling bench-loop-web repo with hot-reload (developer mode).")
+@click.option(
+    "--port",
+    "port",
+    default=8877,
+    show_default=True,
+    type=int,
+    help="Port for the dashboard (API + UI).",
+)
+@click.option(
+    "--api-port",
+    default=None,
+    type=int,
+    help="DEPRECATED. Same as --port; kept for compatibility.",
+)
+@click.option(
+    "--ui-port", default=None, type=int, help="DEPRECATED. UI is now served by the API."
+)
+@click.option(
+    "--api-only", is_flag=True, help="Legacy flag, no-op now that UI is bundled."
+)
+@click.option(
+    "--dev/--no-dev",
+    default=False,
+    help="Use the sibling bench-loop-web repo with hot-reload (developer mode).",
+)
 @click.option(
     "--service-template",
     type=click.Choice(["launchd", "systemd", "windows-task"], case_sensitive=False),
     default=None,
     help="Print a persistence template instead of launching the dashboard.",
 )
-def dashboard(host: str, port: int, api_port: int | None, ui_port: int | None, api_only: bool, dev: bool, service_template: str | None) -> None:
+def dashboard(
+    host: str,
+    port: int,
+    api_port: int | None,
+    ui_port: int | None,
+    api_only: bool,
+    dev: bool,
+    service_template: str | None,
+) -> None:
     """Launch the local web dashboard.
 
     By default this runs the bundled FastAPI + React app that ships inside the
@@ -426,7 +568,7 @@ def dashboard(host: str, port: int, api_port: int | None, ui_port: int | None, a
     if service_template:
         command = f"benchloop dashboard --host {host} --port {port}"
         if service_template == "launchd":
-            click.echo(f'''<?xml version="1.0" encoding="UTF-8"?>
+            click.echo(f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
   <dict>
@@ -442,9 +584,9 @@ def dashboard(host: str, port: int, api_port: int | None, ui_port: int | None, a
     <key>StandardOutPath</key><string>~/Library/Logs/benchloop-dashboard.log</string>
     <key>StandardErrorPath</key><string>~/Library/Logs/benchloop-dashboard.err</string>
   </dict>
-</plist>''')
+</plist>""")
         elif service_template == "systemd":
-            click.echo(f'''[Unit]
+            click.echo(f"""[Unit]
 Description=BenchLoop dashboard
 After=network.target
 
@@ -456,7 +598,7 @@ RestartSec=5
 Environment=PYTHONUNBUFFERED=1
 
 [Install]
-WantedBy=multi-user.target''')
+WantedBy=multi-user.target""")
         else:
             click.echo(f'''# PowerShell Scheduled Task / startup command
 # Run this in a persistent shell or wrap it in Task Scheduler:
@@ -468,10 +610,12 @@ WantedBy=multi-user.target''')
         return
 
     if dev:
-        web_dir = Path(os.environ.get(
-            "BENCHLOOP_WEB_DIR",
-            Path(__file__).resolve().parent.parent.parent / "bench-loop-web",
-        )).resolve()
+        web_dir = Path(
+            os.environ.get(
+                "BENCHLOOP_WEB_DIR",
+                Path(__file__).resolve().parent.parent.parent / "bench-loop-web",
+            )
+        ).resolve()
         api_dir = web_dir / "api"
         ui_dir = web_dir / "ui"
         if not api_dir.is_dir():
@@ -484,10 +628,23 @@ WantedBy=multi-user.target''')
             sys.exit(1)
         env = os.environ.copy()
         env["BENCH_LOOP_DIR"] = str(Path(__file__).resolve().parent.parent)
-        env["PYTHONPATH"] = env["BENCH_LOOP_DIR"] + os.pathsep + env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = (
+            env["BENCH_LOOP_DIR"] + os.pathsep + env.get("PYTHONPATH", "")
+        )
         api_proc = subprocess.Popen(
-            [sys.executable, "-m", "uvicorn", "main:app",
-             "--host", host, "--port", str(port), "--app-dir", str(api_dir), "--reload"],
+            [
+                sys.executable,
+                "-m",
+                "uvicorn",
+                "main:app",
+                "--host",
+                host,
+                "--port",
+                str(port),
+                "--app-dir",
+                str(api_dir),
+                "--reload",
+            ],
             env=env,
         )
         click.echo(f"BenchLoop API (dev):  http://{host}:{port}")
@@ -513,10 +670,22 @@ WantedBy=multi-user.target''')
             sys.exit(1)
         env = os.environ.copy()
         env["BENCH_LOOP_DIR"] = str(Path(__file__).resolve().parent.parent)
-        env["PYTHONPATH"] = env["BENCH_LOOP_DIR"] + os.pathsep + env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = (
+            env["BENCH_LOOP_DIR"] + os.pathsep + env.get("PYTHONPATH", "")
+        )
         api_proc = subprocess.Popen(
-            [sys.executable, "-m", "uvicorn", "main:app",
-             "--host", host, "--port", str(port), "--app-dir", str(api_dir)],
+            [
+                sys.executable,
+                "-m",
+                "uvicorn",
+                "main:app",
+                "--host",
+                host,
+                "--port",
+                str(port),
+                "--app-dir",
+                str(api_dir),
+            ],
             env=env,
         )
         url = f"http://{host}:{port}"

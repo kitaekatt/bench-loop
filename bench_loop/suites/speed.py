@@ -1,4 +1,5 @@
 """Speed suite fixture loader and evaluation."""
+
 from __future__ import annotations
 
 import math
@@ -25,7 +26,7 @@ class SpeedSuite(BenchmarkSuite):
             total_latency_ms=float(response.get("total_ms") or 0.0),
         )
 
-        is_cloud = ttft_ms > 0 and generation_tok_per_sec > 0
+        is_cloud = bool(response.get("_benchloop_remote", False))
 
         if is_cloud:
             score = self._cloud_speed_score(generation_tok_per_sec, ttft_ms)
@@ -59,6 +60,7 @@ class SpeedSuite(BenchmarkSuite):
                 "prompt_eval_duration": int(response.get("prompt_eval_duration") or 0),
                 "load_duration": int(response.get("load_duration") or 0),
                 "is_cloud_speed": is_cloud,
+                "speed_mode": "remote" if is_cloud else "local",
             },
         )
 

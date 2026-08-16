@@ -1,17 +1,15 @@
 """Coding suite execution and evaluation."""
+
 from __future__ import annotations
 
 import re
-import subprocess
-import sys
-import tempfile
 from pathlib import Path
 from typing import Any
 
 from bench_loop.config import TASKS_DIR
 from bench_loop.models import BenchmarkTask, TaskResult
+from bench_loop.sandbox import run_restricted_python
 from bench_loop.suites.base import BenchmarkSuite
-
 
 CODE_BLOCK_RE = re.compile(r"```python\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 GENERIC_BLOCK_RE = re.compile(r"```\s*(.*?)```", re.DOTALL)
@@ -58,26 +56,16 @@ class CodingSuite(BenchmarkSuite):
                 metadata={"evaluation_status": "syntax_error"},
             )
 
-        script = f"{code}\n\n{test_code}\n"
-        with tempfile.TemporaryDirectory(prefix="bench-loop-coding-") as temp_dir:
-            script_path = Path(temp_dir) / "task.py"
-            script_path.write_text(script, encoding="utf-8")
-            try:
-                completed = subprocess.run(
-                    [sys.executable, str(script_path)],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                    check=False,
-                )
-                stdout = completed.stdout or ""
-                stderr = completed.stderr or ""
-            except subprocess.TimeoutExpired:
-                stdout = ""
-                stderr = "Timed out after 10s"
-                completed = None
+        sandbox_result = run_restricted_python(code, test_code, timeout_sec=10.0)
+        stdout = sandbox_result.stdout
+        stderr = sandbox_result.stderr
 
-        if completed is not None and completed.returncode == 0 and "PASS" in stdout:
+        if sandbox_result.rejected:
+            passed = False
+            score = 0.0
+            error = f"Sandbox policy rejected code: {sandbox_result.rejection_reason}"
+            status = "sandbox_policy_rejected"
+        elif sandbox_result.returncode == 0 and "PASS" in stdout:
             passed = True
             score = 100.0
             error = ""
@@ -86,15 +74,15 @@ class CodingSuite(BenchmarkSuite):
             passed = False
             score = 25.0
             status = "tests_failed_or_runtime_error"
-            combined_error = (stderr.strip() or stdout.strip() or "")
-            if completed is None:
+            combined_error = stderr.strip() or stdout.strip() or ""
+            if sandbox_result.timed_out:
                 error = stderr
             elif "SyntaxError" in combined_error:
                 score = 0.0
                 status = "syntax_error"
                 error = combined_error
-            elif completed.returncode != 0:
-                error = combined_error or f"exit code {completed.returncode}"
+            elif sandbox_result.returncode != 0:
+                error = combined_error or f"exit code {sandbox_result.returncode}"
             else:
                 error = combined_error or "Tests did not report PASS"
 
@@ -109,5 +97,8 @@ class CodingSuite(BenchmarkSuite):
                 "stdout": stdout,
                 "stderr": stderr,
                 "evaluation_status": status,
+                "execution_mode": "restricted_python",
+                "policy_rejected": sandbox_result.rejected,
+                "timed_out": sandbox_result.timed_out,
             },
         )

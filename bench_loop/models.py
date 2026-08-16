@@ -1,4 +1,5 @@
 """Core data models for BenchLoop results and configuration."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -80,6 +81,7 @@ class TaskResult:
     tokens_prompt: int = 0
     error: str = ""
     output: str = ""
+    execution_ok: bool = True
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -100,16 +102,31 @@ class SpeedMetrics:
     prompt_eval_tok_per_sec: float = 0.0
     generation_tok_per_sec: float = 0.0
     total_latency_ms: float = 0.0
+    generation_tok_per_sec_p50: float = 0.0
+    generation_tok_per_sec_p95: float = 0.0
+    ttft_ms_p50: float = 0.0
+    ttft_ms_p95: float = 0.0
+    sample_count: int = 0
 
 
 @dataclass
 class BenchmarkRun:
     """Top-level result for one complete benchmark run."""
 
-    version: str = "0.1.0"
+    version: str = "0.3.0"
+    benchmark_id: str = "benchloop"
+    benchmark_version: str = "3.0.0"
+    benchmark_profile: str = "custom"
+    requested_profile: str = "core"
+    manifest_hash: str = ""
+    score_schema_version: str = "3.0.0"
+    coverage_score: float = 0.0
+    comparable: bool = False
     timestamp: str = ""
     model: ModelInfo = field(default_factory=lambda: ModelInfo(model_id="unknown"))
-    machine: MachineInfo = field(default_factory=lambda: MachineInfo(machine_id="unknown"))
+    machine: MachineInfo = field(
+        default_factory=lambda: MachineInfo(machine_id="unknown")
+    )
     provider: str = "ollama"
     harness: str = "raw"
     harness_version: str = ""
@@ -124,42 +141,41 @@ class BenchmarkRun:
     suites: dict[str, SuiteResult] = field(default_factory=dict)
 
     def compute_aggregates(self) -> None:
-        quality_suites = [
-            suite_result
-            for name, suite_result in self.suites.items()
-            if name != SuiteName.SPEED and name != SuiteName.SPEED.value
-        ]
-        if quality_suites:
-            self.quality_score = sum(s.score for s in quality_suites) / len(quality_suites)
+        # Import lazily to keep the core dataclasses free of an import cycle.
+        from bench_loop.benchmark_manifest import quality_weights_for
 
-        speed_suite = self.suites.get(SuiteName.SPEED) or self.suites.get(SuiteName.SPEED.value)
+        weight_profile = (
+            self.benchmark_profile
+            if self.benchmark_profile != "custom"
+            else self.requested_profile
+        )
+        weights = quality_weights_for(weight_profile, self.suites)
+        if weights:
+            self.quality_score = sum(
+                self.suites[name].score * weight for name, weight in weights.items()
+            )
+
+        speed_suite = self.suites.get(SuiteName.SPEED) or self.suites.get(
+            SuiteName.SPEED.value
+        )
         if speed_suite:
             self.speed_score = speed_suite.score
 
-        total_tasks = sum(s.task_count for s in self.suites.values())
-        total_passed = sum(s.pass_count for s in self.suites.values())
-        self.reliability_score = (total_passed / total_tasks * 100) if total_tasks > 0 else 0.0
+        tasks = [task for suite in self.suites.values() for task in suite.tasks]
+        execution_ok = sum(1 for task in tasks if task.execution_ok)
+        self.reliability_score = (execution_ok / len(tasks) * 100) if tasks else 0.0
 
-        if self.is_remote:
-            # Remote/cloud: use cloud-aware speed scoring when available.
-            # If speed suite has data (from streaming TTFT + tok/s), include it.
-            if self.speed_score > 0:
-                self.overall_score = (
-                    0.50 * self.quality_score
-                    + 0.25 * self.speed_score
-                    + 0.25 * self.reliability_score
-                )
-            else:
-                # No speed data — fall back to quality + reliability only
-                self.overall_score = (
-                    0.65 * self.quality_score
-                    + 0.35 * self.reliability_score
-                )
+        # v3 stops counting task correctness twice. Quality owns correctness;
+        # reliability is reserved for endpoint/runtime execution stability.
+        if self.speed_score > 0:
+            self.overall_score = (
+                0.70 * self.quality_score
+                + 0.25 * self.speed_score
+                + 0.05 * self.reliability_score
+            )
         else:
             self.overall_score = (
-                0.55 * self.quality_score
-                + 0.20 * self.speed_score
-                + 0.25 * self.reliability_score
+                0.90 * self.quality_score + 0.10 * self.reliability_score
             )
 
         speed_factor = (
@@ -168,7 +184,13 @@ class BenchmarkRun:
             else 0.5
         )
         reliability_factor = self.reliability_score / 100
-        self.value_score = self.quality_score * speed_factor * reliability_factor
+        self.quality_score = round(self.quality_score, 2)
+        self.speed_score = round(self.speed_score, 2)
+        self.reliability_score = round(self.reliability_score, 2)
+        self.overall_score = round(self.overall_score, 2)
+        self.value_score = round(
+            self.quality_score * speed_factor * reliability_factor, 2
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return _asdict_recursive(self)
@@ -178,7 +200,10 @@ def _asdict_recursive(obj: Any) -> Any:
     import dataclasses
 
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
-        return {key: _asdict_recursive(value) for key, value in dataclasses.asdict(obj).items()}
+        return {
+            key: _asdict_recursive(value)
+            for key, value in dataclasses.asdict(obj).items()
+        }
     if isinstance(obj, dict):
         return {key: _asdict_recursive(value) for key, value in obj.items()}
     if isinstance(obj, list):
