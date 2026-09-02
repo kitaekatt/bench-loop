@@ -176,7 +176,7 @@ def start_pairing(
         )
     except httpx.HTTPError as exc:
         raise CloudError(f"Could not reach the BenchLoop API at {resolved}.") from exc
-    if response.status_code != 200:
+    if response.status_code not in {200, 201}:
         detail = _json_response(response).get("error", response.text[:160])
         raise CloudError(
             f"Pairing could not start (HTTP {response.status_code}): {detail}"
@@ -319,11 +319,12 @@ def publish_run(
 
 
 def _public_run_payload(run: dict[str, Any], run_path: Path) -> dict[str, Any]:
-    """Strip local endpoints, machine IDs, raw outputs, and task metadata."""
+    """Strip local endpoints, raw outputs, and task metadata."""
     machine = run.get("machine") or {}
     public_machine = {
         key: machine.get(key)
         for key in (
+            "machine_id",
             "cpu",
             "gpu",
             "gpu_memory_gb",
