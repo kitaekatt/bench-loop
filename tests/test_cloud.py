@@ -127,7 +127,7 @@ def test_publish_sends_bearer_token_and_explicit_visibility(
     assert result["run_id"] == 42
 
 
-def test_publish_removes_private_machine_and_raw_output_fields(
+def test_publish_removes_private_endpoint_and_raw_output_fields(
     tmp_path, monkeypatch
 ) -> None:
     path = tmp_path / "run.json"
@@ -165,7 +165,14 @@ def test_publish_removes_private_machine_and_raw_output_fields(
     cloud.publish_run(path, base_url="https://api.test/v1")
     published = captured["json"]["run"]
 
-    assert published["machine"] == {"gpu": "RTX 4090"}
+    # machine_id is published DELIBERATELY (fleet decision, 2026-09-02): runs are
+    # meant to be attributable to the machine that produced them. The endpoint and
+    # remote_host are still stripped -- a tailnet hostname and a LAN address are
+    # what this test actually guards.
+    assert published["machine"] == {
+        "machine_id": "private-host-id",
+        "gpu": "RTX 4090",
+    }
     assert "command_used" not in published
     assert "output" not in published["suites"]["coding"]["tasks"][0]
     assert "metadata" not in published["suites"]["coding"]["tasks"][0]
